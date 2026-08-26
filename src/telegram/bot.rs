@@ -15,25 +15,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+}
 
 #[derive(Clone)]
 pub struct TelegramBot {
     client: Client,
     pub token: String,
     pool: DbPool,
-    secret_key: String,
     running: Arc<AtomicBool>,
     started_at: chrono::DateTime<Utc>,
 }
 
 impl TelegramBot {
-    pub fn new(token: String, pool: DbPool, secret_key: String) -> Self {
+    pub fn new(token: String, pool: DbPool, _secret_key: String) -> Self {
         Self {
             client: Client::builder().timeout(Duration::from_secs(35)).build().unwrap(),
             token,
             pool,
-            secret_key,
             running: Arc::new(AtomicBool::new(false)),
             started_at: Utc::now(),
         }
@@ -76,7 +81,7 @@ impl TelegramBot {
             "text": text,
             "parse_mode": "HTML",
         });
-        if let Some(rm) = reply_markup {
+        if let Some(rm) = reply_markup.clone() {
             body["reply_markup"] = rm;
         }
 
@@ -86,7 +91,33 @@ impl TelegramBot {
             .await
             .map_err(|e| e.to_string())?;
 
-        resp.json::<Value>().await.map_err(|e| e.to_string())
+        let val = resp.json::<Value>().await.map_err(|e| e.to_string())?;
+        if !val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let desc = val.get("description").and_then(|d| d.as_str()).unwrap_or("Telegram API error");
+            warn!("Telegram sendMessage HTML parse failed: {}. Retrying without HTML formatting...", desc);
+
+            let mut fallback_body = json!({
+                "chat_id": chat_id,
+                "text": text,
+            });
+            if let Some(rm) = reply_markup {
+                fallback_body["reply_markup"] = rm;
+            }
+            let resp2 = self.client.post(&self.api_url("sendMessage"))
+                .json(&fallback_body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let val2 = resp2.json::<Value>().await.map_err(|e| e.to_string())?;
+            if !val2.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let desc2 = val2.get("description").and_then(|d| d.as_str()).unwrap_or("Telegram API error");
+                error!("Telegram sendMessage failed: {}", desc2);
+                return Err(desc2.to_string());
+            }
+            return Ok(val2);
+        }
+
+        Ok(val)
     }
 
     pub async fn send_photo(&self, chat_id: i64, photo_bytes: Vec<u8>, caption: &str, reply_markup: Option<Value>) -> Result<Value, String> {
@@ -101,7 +132,7 @@ impl TelegramBot {
             .text("parse_mode", "HTML")
             .part("photo", part);
 
-        if let Some(rm) = reply_markup {
+        if let Some(rm) = reply_markup.clone() {
             form = form.text("reply_markup", rm.to_string());
         }
 
@@ -111,7 +142,14 @@ impl TelegramBot {
             .await
             .map_err(|e| e.to_string())?;
 
-        resp.json::<Value>().await.map_err(|e| e.to_string())
+        let val = resp.json::<Value>().await.map_err(|e| e.to_string())?;
+        if !val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let desc = val.get("description").and_then(|d| d.as_str()).unwrap_or("Telegram sendPhoto error");
+            warn!("Telegram sendPhoto failed: {}. Falling back to text sendMessage.", desc);
+            return self.send_message(chat_id, caption, reply_markup).await;
+        }
+
+        Ok(val)
     }
 
     pub async fn answer_callback_query(&self, callback_query_id: &str, text: Option<&str>) -> Result<(), String> {
@@ -302,12 +340,24 @@ impl TelegramBot {
         let id = cb.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let data = cb.get("data").and_then(|v| v.as_str()).unwrap_or("");
         let message = cb.get("message");
-        let chat_id = message.and_then(|m| m.get("chat")).and_then(|c| c.get("id")).and_then(|v| v.as_i64()).unwrap_or(0);
         let from = cb.get("from");
-        let tg_user_id = from.and_then(|f| f.get("id")).and_then(|v| v.as_i64()).unwrap_or(chat_id);
+        let tg_user_id = from.and_then(|f| f.get("id")).and_then(|v| v.as_i64()).unwrap_or(0);
+        let username = from.and_then(|f| f.get("username")).and_then(|v| v.as_str()).unwrap_or("");
+        let first_name = from.and_then(|f| f.get("first_name")).and_then(|v| v.as_str()).unwrap_or("");
+        let last_name = from.and_then(|f| f.get("last_name")).and_then(|v| v.as_str()).unwrap_or("");
 
-        let lang = self.get_user_language(tg_user_id);
+        let raw_chat_id = message.and_then(|m| m.get("chat")).and_then(|c| c.get("id")).and_then(|v| v.as_i64()).unwrap_or(0);
+        let chat_id = if raw_chat_id != 0 { raw_chat_id } else { tg_user_id };
+
+        if chat_id == 0 {
+            warn!("Telegram callback_query has no valid chat_id: data={}", data);
+            return;
+        }
+
+        let lang = self.ensure_telegram_user(tg_user_id, username, first_name, last_name);
         let _ = self.answer_callback_query(id, None).await;
+
+        info!("Telegram callback: user={}, chat={}, data={}", tg_user_id, chat_id, data);
 
         if data == "menu:home" {
             self.send_home_menu(chat_id, tg_user_id, &lang).await;
@@ -534,17 +584,37 @@ impl TelegramBot {
         };
 
         if items.is_empty() {
-            let _ = self.send_message(chat_id, &t("no_peers", lang), None).await;
+            if self.is_admin(tg_user_id, None) {
+                let msg = "ℹ️ <b>No personal connections linked.</b>\nAs an administrator, you can view usage for all peers in the 🛡️ <b>Admin Panel</b>.";
+                let kb = json!({
+                    "inline_keyboard": [
+                        [
+                            { "text": "📊 All Peers Today", "callback_data": "adm:peers:today" },
+                            { "text": "🛡️ Admin Panel", "callback_data": "adm:menu" }
+                        ],
+                        [
+                            { "text": "🏠 Home", "callback_data": "menu:home" }
+                        ]
+                    ]
+                });
+                let _ = self.send_message(chat_id, msg, Some(kb)).await;
+            } else {
+                let _ = self.send_message(chat_id, &t("no_peers", lang), None).await;
+            }
             return;
         }
 
         let title = t("today_title", lang);
         for (peer_name, rx, tx) in items {
+            let escaped_name = escape_html(&peer_name);
+            let caption = format!("📊 <b>{}</b> - {}\n⬇️ {}\n⬆️ {}\n📈 <b>Total:</b> {}",
+                title, escaped_name, fmt_bytes(rx), fmt_bytes(tx), fmt_bytes(rx + tx));
+
             let svg = generate_usage_chart_svg(&title, &peer_name, rx, tx, &[("Today".to_string(), rx, tx)]);
             if let Ok(png) = render_svg_to_png(&svg, 2.0) {
-                let caption = format!("📊 <b>{}</b> - {}\n⬇️ {}\n⬆️ {}\n📈 Total: {}",
-                    title, peer_name, fmt_bytes(rx), fmt_bytes(tx), fmt_bytes(rx + tx));
                 let _ = self.send_photo(chat_id, png, &caption, None).await;
+            } else {
+                let _ = self.send_message(chat_id, &caption, None).await;
             }
         }
     }
@@ -580,17 +650,37 @@ impl TelegramBot {
         };
 
         if items.is_empty() {
-            let _ = self.send_message(chat_id, &t("no_peers", lang), None).await;
+            if self.is_admin(tg_user_id, None) {
+                let msg = "ℹ️ <b>No personal connections linked.</b>\nAs an administrator, you can view monthly usage for all peers in the 🛡️ <b>Admin Panel</b>.";
+                let kb = json!({
+                    "inline_keyboard": [
+                        [
+                            { "text": "📅 All Peers Month", "callback_data": "adm:peers:monthly" },
+                            { "text": "🛡️ Admin Panel", "callback_data": "adm:menu" }
+                        ],
+                        [
+                            { "text": "🏠 Home", "callback_data": "menu:home" }
+                        ]
+                    ]
+                });
+                let _ = self.send_message(chat_id, msg, Some(kb)).await;
+            } else {
+                let _ = self.send_message(chat_id, &t("no_peers", lang), None).await;
+            }
             return;
         }
 
         let title = t("monthly_title", lang);
         for (peer_name, totals, points) in items {
+            let escaped_name = escape_html(&peer_name);
+            let caption = format!("📅 <b>{}</b> - {}\n⬇️ {}\n⬆️ {}\n📈 <b>Total:</b> {}",
+                title, escaped_name, fmt_bytes(totals.0), fmt_bytes(totals.1), fmt_bytes(totals.0 + totals.1));
+
             let svg = generate_usage_chart_svg(&title, &peer_name, totals.0, totals.1, &points);
             if let Ok(png) = render_svg_to_png(&svg, 2.0) {
-                let caption = format!("📅 <b>{}</b> - {}\n⬇️ {}\n⬆️ {}\n📈 Total: {}",
-                    title, peer_name, fmt_bytes(totals.0), fmt_bytes(totals.1), fmt_bytes(totals.0 + totals.1));
                 let _ = self.send_photo(chat_id, png, &caption, None).await;
+            } else {
+                let _ = self.send_message(chat_id, &caption, None).await;
             }
         }
     }
@@ -618,17 +708,37 @@ impl TelegramBot {
         };
 
         if items.is_empty() {
-            let _ = self.send_message(chat_id, &t("no_peers", lang), None).await;
+            if self.is_admin(tg_user_id, None) {
+                let msg = "ℹ️ <b>No personal connections linked.</b>\nAs an administrator, you can view all-time bandwidth for all peers in the 🛡️ <b>Admin Panel</b>.";
+                let kb = json!({
+                    "inline_keyboard": [
+                        [
+                            { "text": "📈 All Peers All Time", "callback_data": "adm:peers:alltime" },
+                            { "text": "🛡️ Admin Panel", "callback_data": "adm:menu" }
+                        ],
+                        [
+                            { "text": "🏠 Home", "callback_data": "menu:home" }
+                        ]
+                    ]
+                });
+                let _ = self.send_message(chat_id, msg, Some(kb)).await;
+            } else {
+                let _ = self.send_message(chat_id, &t("no_peers", lang), None).await;
+            }
             return;
         }
 
         let title = t("alltime_title", lang);
         for (peer_name, totals) in items {
+            let escaped_name = escape_html(&peer_name);
+            let caption = format!("📈 <b>{}</b> - {}\n⬇️ {}\n⬆️ {}\n📈 <b>Total:</b> {}",
+                title, escaped_name, fmt_bytes(totals.0), fmt_bytes(totals.1), fmt_bytes(totals.0 + totals.1));
+
             let svg = generate_usage_chart_svg(&title, &peer_name, totals.0, totals.1, &[("All Time".to_string(), totals.0, totals.1)]);
             if let Ok(png) = render_svg_to_png(&svg, 2.0) {
-                let caption = format!("📈 <b>{}</b> - {}\n⬇️ {}\n⬆️ {}\n📈 Total: {}",
-                    title, peer_name, fmt_bytes(totals.0), fmt_bytes(totals.1), fmt_bytes(totals.0 + totals.1));
                 let _ = self.send_photo(chat_id, png, &caption, None).await;
+            } else {
+                let _ = self.send_message(chat_id, &caption, None).await;
             }
         }
     }
@@ -650,10 +760,11 @@ impl TelegramBot {
                 peers.into_iter().map(|peer| {
                     let dto = build_fair_usage_peer_status_dto(&conn, &peer, now_utc, tz, calendar, 1);
                     let peer_name = if !peer.name.is_empty() { peer.name } else { peer.interface };
+                    let escaped_name = escape_html(&peer_name);
                     let svg = generate_fair_usage_card_svg(&dto, &peer_name);
                     let status_icon = if dto.throttled { "🔴" } else { "🟢" };
                     let caption = format!("{} <b>Fair Usage Policy</b> - {}\nState: {}\nDown/Up: {} / {} Kbps",
-                        status_icon, peer_name, if dto.throttled { "Throttled" } else { "Normal" },
+                        status_icon, escaped_name, if dto.throttled { "Throttled" } else { "Normal" },
                         dto.throttle_download_kbps, dto.throttle_upload_kbps);
                     (svg, caption)
                 }).collect::<Vec<_>>()
@@ -661,13 +772,28 @@ impl TelegramBot {
         };
 
         if items.is_empty() {
-            let _ = self.send_message(chat_id, &t("no_peers", lang), None).await;
+            if self.is_admin(tg_user_id, None) {
+                let msg = "ℹ️ <b>No personal connections linked.</b>\nAs an administrator, you can check system peers and status in the 🛡️ <b>Admin Panel</b>.";
+                let kb = json!({
+                    "inline_keyboard": [
+                        [
+                            { "text": "🛡️ Admin Panel", "callback_data": "adm:menu" },
+                            { "text": "🏠 Home", "callback_data": "menu:home" }
+                        ]
+                    ]
+                });
+                let _ = self.send_message(chat_id, msg, Some(kb)).await;
+            } else {
+                let _ = self.send_message(chat_id, &t("no_peers", lang), None).await;
+            }
             return;
         }
 
         for (svg, caption) in items {
             if let Ok(png) = render_svg_to_png(&svg, 2.0) {
                 let _ = self.send_photo(chat_id, png, &caption, None).await;
+            } else {
+                let _ = self.send_message(chat_id, &caption, None).await;
             }
         }
     }
@@ -829,7 +955,7 @@ impl TelegramBot {
                                 let pub_key: String = r.get(2)?;
                                 let iface: String = r.get(3)?;
                                 let display = if !name.is_empty() { name } else { pub_key.chars().take(8).collect::<String>() };
-                                Ok(format!("• {} ({})", display, iface))
+                                Ok(format!("• {} ({})", escape_html(&display), escape_html(&iface)))
                             }).unwrap().flatten().collect()
                         }
                         Err(_) => Vec::new(),
@@ -853,7 +979,7 @@ impl TelegramBot {
 
         let text = format!(
             "👤 <b>User Details</b>\n\n<b>ID:</b> <code>{}</code>\n<b>Username:</b> @{}\n<b>Name:</b> {} {}\n<b>Language:</b> {}\n<b>Status:</b> {}\n<b>Created:</b> {}\n\n<b>Linked Peers:</b>\n{}",
-            target_tg_id, uname, fname, lname, user_lang, if is_blocked { "🔴 Blocked" } else { "🟢 Active" }, created_at, peers_list
+            target_tg_id, escape_html(&uname), escape_html(&fname), escape_html(&lname), escape_html(&user_lang), if is_blocked { "🔴 Blocked" } else { "🟢 Active" }, created_at, peers_list
         );
 
         let keyboard = json!({
@@ -947,7 +1073,7 @@ impl TelegramBot {
                 ttx += tx;
                 if rx > 0 || tx > 0 {
                     lns.push(format!("• <b>{}</b> ({})\n  ⬇️ {} | ⬆️ {} | Total: {}",
-                        display, iface, fmt_bytes(rx), fmt_bytes(tx), fmt_bytes(rx + tx)));
+                        escape_html(&display), escape_html(&iface), fmt_bytes(rx), fmt_bytes(tx), fmt_bytes(rx + tx)));
                 }
             }
 
@@ -1024,7 +1150,7 @@ impl TelegramBot {
                         let preview: String = body.chars().take(40).collect();
                         Ok(format!(
                             "📢 <b>Broadcast #{}</b> ({})\nStatus: <b>{}</b> (sent: {}, failed: {}, total: {})\nCreated: {}\nPreview: <i>{}</i>",
-                            id, mode, status, sent_c, failed_c, total_c, created_at, preview
+                            id, escape_html(&mode), escape_html(&status), sent_c, failed_c, total_c, escape_html(&created_at), escape_html(&preview)
                         ))
                     }).unwrap().flatten().collect()
                 }

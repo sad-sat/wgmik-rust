@@ -1,6 +1,14 @@
 use super::svg_render::fmt_bytes;
 use crate::fair_usage::FairUsagePeerStatusDTO;
 
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+     .replace('\'', "&apos;")
+}
+
 pub fn generate_fair_usage_card_svg(dto: &FairUsagePeerStatusDTO, peer_name: &str) -> String {
     let width = 640.0;
     let height = 300.0;
@@ -21,11 +29,14 @@ pub fn generate_fair_usage_card_svg(dto: &FairUsagePeerStatusDTO, peer_name: &st
     let fill_width = (bar_width * (pct / 100.0)).max(0.0);
     let bar_color = if is_throttled { "#dc2626" } else { "#2563eb" };
 
+    let safe_name = escape_xml(peer_name);
+    let safe_scope = escape_xml(&dto.scope_label);
+
     let mut out = String::new();
     out.push_str(&format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"0 0 {} {}\">\n", width, height, width, height));
     out.push_str(&format!("  <rect width=\"{}\" height=\"{}\" rx=\"16\" fill=\"#ffffff\"/>\n", width, height));
     out.push_str("  <text x=\"40\" y=\"44\" font-family=\"Vazirmatn\" font-size=\"20\" font-weight=\"bold\" fill=\"#111827\">Fair Usage Policy</text>\n");
-    out.push_str(&format!("  <text x=\"40\" y=\"68\" font-family=\"Vazirmatn\" font-size=\"14\" fill=\"#6b7280\">{}</text>\n", peer_name));
+    out.push_str(&format!("  <text x=\"40\" y=\"68\" font-family=\"Vazirmatn\" font-size=\"14\" fill=\"#6b7280\">{}</text>\n", safe_name));
     out.push_str(&format!("  <rect x=\"480\" y=\"30\" width=\"100\" height=\"28\" rx=\"14\" fill=\"{}\"/>\n", status_bg));
     out.push_str(&format!("  <text x=\"530\" y=\"49\" font-family=\"Vazirmatn\" font-size=\"13\" font-weight=\"bold\" fill=\"{}\" text-anchor=\"middle\">{}</text>\n", status_color, status_text));
 
@@ -36,11 +47,11 @@ pub fn generate_fair_usage_card_svg(dto: &FairUsagePeerStatusDTO, peer_name: &st
 
     out.push_str("  <rect x=\"40\" y=\"185\" width=\"250\" height=\"70\" rx=\"12\" fill=\"#f9fafb\"/>\n");
     out.push_str("  <text x=\"60\" y=\"212\" font-family=\"Vazirmatn\" font-size=\"12\" fill=\"#6b7280\">Speed Limit</text>\n");
-    out.push_str(&format!("  <text x=\"60\" y=\"238\" font-family=\"Vazirmatn\" font-size=\"16\" font-weight=\"bold\" fill=\"#111827\">&darr; {} Kbps / &uarr; {} Kbps</text>\n", dto.throttle_download_kbps, dto.throttle_upload_kbps));
+    out.push_str(&format!("  <text x=\"60\" y=\"238\" font-family=\"Vazirmatn\" font-size=\"16\" font-weight=\"bold\" fill=\"#111827\">↓ {} Kbps / ↑ {} Kbps</text>\n", dto.throttle_download_kbps, dto.throttle_upload_kbps));
 
     out.push_str("  <rect x=\"310\" y=\"185\" width=\"250\" height=\"70\" rx=\"12\" fill=\"#f9fafb\"/>\n");
     out.push_str("  <text x=\"330\" y=\"212\" font-family=\"Vazirmatn\" font-size=\"12\" fill=\"#6b7280\">Reset Cycle</text>\n");
-    out.push_str(&format!("  <text x=\"330\" y=\"238\" font-family=\"Vazirmatn\" font-size=\"16\" font-weight=\"bold\" fill=\"#111827\">{}</text>\n", dto.scope_label));
+    out.push_str(&format!("  <text x=\"330\" y=\"238\" font-family=\"Vazirmatn\" font-size=\"16\" font-weight=\"bold\" fill=\"#111827\">{}</text>\n", safe_scope));
     out.push_str("</svg>\n");
 
     out

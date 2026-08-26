@@ -1,5 +1,13 @@
 use super::svg_render::fmt_bytes;
 
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+     .replace('\'', "&apos;")
+}
+
 pub fn generate_usage_chart_svg(
     title: &str,
     peer_name: &str,
@@ -44,28 +52,38 @@ pub fn generate_usage_chart_svg(
     }
 
     let mut rx_d = String::new();
-    for (i, (x, y)) in rx_path_points.iter().enumerate() {
-        if i == 0 {
-            rx_d.push_str(&format!("M {:.1},{:.1}", x, y));
-        } else {
-            rx_d.push_str(&format!(" L {:.1},{:.1}", x, y));
+    let mut tx_d = String::new();
+
+    if n == 1 {
+        let (_x, y_rx) = rx_path_points[0];
+        let (_, y_tx) = tx_path_points[0];
+        rx_d = format!("M {:.1},{:.1} L {:.1},{:.1}", margin_left, y_rx, width - margin_right, y_rx);
+        tx_d = format!("M {:.1},{:.1} L {:.1},{:.1}", margin_left, y_tx, width - margin_right, y_tx);
+    } else {
+        for (i, (x, y)) in rx_path_points.iter().enumerate() {
+            if i == 0 {
+                rx_d.push_str(&format!("M {:.1},{:.1}", x, y));
+            } else {
+                rx_d.push_str(&format!(" L {:.1},{:.1}", x, y));
+            }
+        }
+        for (i, (x, y)) in tx_path_points.iter().enumerate() {
+            if i == 0 {
+                tx_d.push_str(&format!("M {:.1},{:.1}", x, y));
+            } else {
+                tx_d.push_str(&format!(" L {:.1},{:.1}", x, y));
+            }
         }
     }
 
-    let mut tx_d = String::new();
-    for (i, (x, y)) in tx_path_points.iter().enumerate() {
-        if i == 0 {
-            tx_d.push_str(&format!("M {:.1},{:.1}", x, y));
-        } else {
-            tx_d.push_str(&format!(" L {:.1},{:.1}", x, y));
-        }
-    }
+    let safe_title = escape_xml(title);
+    let safe_name = escape_xml(peer_name);
 
     let mut out = String::new();
     out.push_str(&format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"0 0 {} {}\">\n", width, height, width, height));
     out.push_str(&format!("  <rect width=\"{}\" height=\"{}\" rx=\"16\" fill=\"#ffffff\"/>\n", width, height));
-    out.push_str(&format!("  <text x=\"{}\" y=\"36\" font-family=\"Vazirmatn\" font-size=\"18\" font-weight=\"bold\" fill=\"#111827\">{}</text>\n", margin_left, title));
-    out.push_str(&format!("  <text x=\"{}\" y=\"56\" font-family=\"Vazirmatn\" font-size=\"13\" fill=\"#6b7280\">{}</text>\n", margin_left, peer_name));
+    out.push_str(&format!("  <text x=\"{}\" y=\"36\" font-family=\"Vazirmatn\" font-size=\"18\" font-weight=\"bold\" fill=\"#111827\">{}</text>\n", margin_left, safe_title));
+    out.push_str(&format!("  <text x=\"{}\" y=\"56\" font-family=\"Vazirmatn\" font-size=\"13\" fill=\"#6b7280\">{}</text>\n", margin_left, safe_name));
     out.push_str(&format!("  <rect x=\"{}\" y=\"24\" width=\"120\" height=\"28\" rx=\"14\" fill=\"#eef2ff\"/>\n", width - margin_right - 120.0));
     out.push_str(&format!("  <text x=\"{}\" y=\"43\" font-family=\"Vazirmatn\" font-size=\"12\" font-weight=\"bold\" fill=\"#4338ca\" text-anchor=\"middle\">Total: {}</text>\n", width - margin_right - 60.0, fmt_bytes(total_combined)));
 
