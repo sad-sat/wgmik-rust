@@ -42,7 +42,12 @@ pub fn build_api_router(state: AppState) -> Router {
         .route("/api/routers/:id/peers/add", post(routers::add_router_peer))
         // Peers
         .route("/api/peers", get(peers::list_peers))
-        .route("/api/peers/:id", patch(peers::patch_peer).delete(peers::delete_peer))
+        .route("/api/peers/:id", get(peers::get_peer).patch(peers::patch_peer).delete(peers::delete_peer))
+        .route("/api/peers/:id/usage", get(peers::get_peer_usage))
+        .route("/api/peers/:id/reset_metrics", post(peers::reset_peer_metrics))
+        .route("/api/peers/:id/reconcile", post(peers::reconcile_peer))
+        .route("/api/peers/:id/client_private_key", get(peers::get_peer_client_private_key))
+        .route("/api/peers/:id/client_export_prefs", get(peers::get_peer_client_export_prefs))
         .route("/api/peers/:id/renew_keys", post(peers::renew_peer_keys))
         .route("/api/peers/:id/router-sync/resolve", post(peers::resolve_peer_sync))
         .route("/api/peers/:id/actions", get(peers::get_peer_actions))

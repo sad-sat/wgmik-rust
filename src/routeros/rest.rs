@@ -129,11 +129,49 @@ impl RouterOSRestClient {
                 let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let public_key = item.get("public-key").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let allowed_address = item.get("allowed-address").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let disabled = item.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
-                let rx_bytes = item.get("rx").and_then(|v| v.as_i64()).unwrap_or(0);
-                let tx_bytes = item.get("tx").and_then(|v| v.as_i64()).unwrap_or(0);
-                let endpoint = item.get("endpoint-address").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let disabled = item.get("disabled").map(|v| {
+                    if let Some(b) = v.as_bool() {
+                        b
+                    } else if let Some(s) = v.as_str() {
+                        let s = s.trim().to_lowercase();
+                        s == "true" || s == "yes" || s == "1"
+                    } else if let Some(n) = v.as_i64() {
+                        n != 0
+                    } else {
+                        false
+                    }
+                }).unwrap_or(false);
+                let rx_bytes = item.get("rx").and_then(|v| {
+                    if let Some(n) = v.as_i64() {
+                        Some(n)
+                    } else if let Some(s) = v.as_str() {
+                        s.trim().parse::<i64>().ok()
+                    } else {
+                        None
+                    }
+                }).unwrap_or(0);
+                let tx_bytes = item.get("tx").and_then(|v| {
+                    if let Some(n) = v.as_i64() {
+                        Some(n)
+                    } else if let Some(s) = v.as_str() {
+                        s.trim().parse::<i64>().ok()
+                    } else {
+                        None
+                    }
+                }).unwrap_or(0);
+                let comment = item.get("comment").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let current_endpoint_address = item.get("current-endpoint-address").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let endpoint = current_endpoint_address.clone().or_else(|| item.get("endpoint-address").and_then(|v| v.as_str()).map(|s| s.to_string()));
                 let client_endpoint = item.get("client-endpoint").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                let last_handshake = item.get("last-handshake").and_then(|v| {
+                    if let Some(n) = v.as_i64() {
+                        return if n > 0 { Some(n) } else { None };
+                    }
+                    if let Some(s) = v.as_str() {
+                        return super::parse_last_handshake_str(s);
+                    }
+                    None
+                });
 
                 peers.push(WGPeer {
                     ros_id,
@@ -142,12 +180,12 @@ impl RouterOSRestClient {
                     public_key,
                     allowed_address,
                     endpoint,
-                    current_endpoint_address: None,
+                    current_endpoint_address,
                     rx_bytes,
                     tx_bytes,
-                    last_handshake: None,
+                    last_handshake,
                     disabled,
-                    comment: None,
+                    comment,
                     client_endpoint: if client_endpoint.is_empty() { None } else { Some(client_endpoint) },
                     client_listen_port: None,
                 });

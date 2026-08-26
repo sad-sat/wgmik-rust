@@ -4,7 +4,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use std::sync::Arc;
 
 pub struct RouterOSApiClient {
     host: String,
@@ -211,8 +210,10 @@ impl RouterOSApiClient {
             let rx_bytes = row.get("rx").and_then(|v| v.parse().ok()).unwrap_or(0);
             let tx_bytes = row.get("tx").and_then(|v| v.parse().ok()).unwrap_or(0);
             let name = row.get("name").cloned().unwrap_or_default();
-            let endpoint = row.get("endpoint-address").cloned();
+            let current_endpoint_address = row.get("current-endpoint-address").cloned();
+            let endpoint = current_endpoint_address.clone().or_else(|| row.get("endpoint-address").cloned());
             let client_endpoint = row.get("client-endpoint").cloned().unwrap_or_default().trim().to_string();
+            let last_handshake = row.get("last-handshake").and_then(|v| super::parse_last_handshake_str(v));
 
             peers.push(WGPeer {
                 ros_id,
@@ -221,10 +222,10 @@ impl RouterOSApiClient {
                 public_key,
                 allowed_address,
                 endpoint,
-                current_endpoint_address: None,
+                current_endpoint_address,
                 rx_bytes,
                 tx_bytes,
-                last_handshake: None,
+                last_handshake,
                 disabled,
                 comment: None,
                 client_endpoint: if client_endpoint.is_empty() { None } else { Some(client_endpoint) },

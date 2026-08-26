@@ -86,7 +86,7 @@ impl Scheduler {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let mut stmt = match conn.prepare("SELECT id, name, host, proto, port, username, secret_enc, tls_verify, enabled, ros_version, ros_supported FROM routers WHERE enabled = 1 AND ros_supported = 1") {
+            let mut stmt = match conn.prepare("SELECT id, name, host, proto, port, username, secret_enc, tls_verify, enabled, ros_version, ros_supported FROM routers WHERE enabled = 1") {
                 Ok(s) => s,
                 Err(_) => return,
             };
@@ -117,12 +117,27 @@ impl Scheduler {
             list
         };
 
-        for router in routers {
-            if !is_routeros_supported(Some(&router.ros_version)) {
+        for mut router in routers {
+            let client = make_client(&router, &self.settings.secret_key, Some(10));
+            if router.ros_version.is_empty() || !router.ros_supported {
+                if let Ok(ver) = client.get_system_version().await {
+                    let supp = is_routeros_supported(Some(&ver));
+                    router.ros_version = ver.clone();
+                    router.ros_supported = supp;
+                    if let Ok(c) = self.pool.get() {
+                        let now_s = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                        let _ = c.execute(
+                            "UPDATE routers SET ros_version = ?1, ros_version_checked_at = ?2, ros_supported = ?3 WHERE id = ?4",
+                            params![ver, now_s, supp, router.id],
+                        );
+                    }
+                }
+            }
+
+            if !router.ros_version.is_empty() && !is_routeros_supported(Some(&router.ros_version)) {
                 continue;
             }
 
-            let client = make_client(&router, &self.settings.secret_key, Some(10));
             let live_peers = match client.list_all_wireguard_peers().await {
                 Ok(p) => p,
                 Err(e) => {
@@ -227,8 +242,8 @@ impl Scheduler {
                 }
             }
 
-            // Usage accounting for selected & synced peers
-            let selected_peers: Vec<Peer> = db_peers.into_iter().filter(|p| p.selected && p.router_sync_status == "synced").collect();
+            // Usage accounting for selected peers
+            let selected_peers: Vec<Peer> = db_peers.into_iter().filter(|p| p.selected).collect();
             for peer in selected_peers {
                 let lp = match live_peers.iter().find(|lp| lp.interface == peer.interface && lp.public_key == peer.public_key) {
                     Some(p) => p,

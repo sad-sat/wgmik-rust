@@ -3,7 +3,7 @@ pub mod schema;
 
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use schema::run_migrations;
+use schema::initialize_database;
 use std::fs;
 use std::path::PathBuf;
 
@@ -39,7 +39,7 @@ pub fn create_pool(database_url: &str) -> DbPool {
 
     {
         let conn = pool.get().expect("Failed to obtain DB connection for migration");
-        run_migrations(&conn).expect("Database migration failed");
+        initialize_database(&conn).expect("Database initialization failed");
     }
 
     pool
@@ -52,5 +52,40 @@ fn sqlite_path_from_url(database_url: &str) -> Option<PathBuf> {
         Some(PathBuf::from(path_str))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fresh_database_initialization() {
+        let temp_dir = std::env::temp_dir().join(format!("wgmik_test_{}", rand::random::<u64>()));
+        let db_path = temp_dir.join("test.db");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let pool = create_pool(&db_url);
+        let conn = pool.get().expect("get conn");
+
+        // Verify users table exists and count query works
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).expect("query users count");
+        assert_eq!(count, 0);
+
+        // Verify insert into users table works
+        let res = conn.execute(
+            "INSERT INTO users (username, hashed_password, is_admin, is_active, session_version, must_change_password)
+             VALUES (?1, ?2, 1, 1, 1, 0)",
+            rusqlite::params!["admin", "some_hash"],
+        );
+        assert!(res.is_ok());
+
+        let count_after: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).expect("query users count after");
+        assert_eq!(count_after, 1);
+
+        // Cleanup
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

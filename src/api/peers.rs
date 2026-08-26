@@ -4,7 +4,7 @@ use crate::calendar::parse_timezone;
 use crate::crypto::{generate_wireguard_keypair, SecretBox};
 use crate::db::models::{Peer, Router};
 use crate::routeros::factory::make_client;
-use axum::extract::{Json, Path, State};
+use axum::extract::{Json, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use chrono::Utc;
@@ -25,14 +25,29 @@ pub struct PeerListDTO {
     pub disabled: bool,
     pub selected: bool,
     pub router_sync_status: String,
+    pub router_sync_first_seen_at: Option<String>,
+    pub router_sync_last_seen_at: Option<String>,
     pub today_rx: i64,
     pub today_tx: i64,
     pub month_rx: i64,
     pub month_tx: i64,
     pub alltime_rx: i64,
     pub alltime_tx: i64,
+    pub current_rx: i64,
+    pub current_tx: i64,
+    pub total_rx: i64,
+    pub total_tx: i64,
     pub is_online: bool,
+    pub online: bool,
     pub last_handshake_ago: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ListPeersQuery {
+    pub router_id: Option<i64>,
+    pub router_ids: Option<String>,
+    pub interface: Option<String>,
+    pub selected_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,7 +89,7 @@ pub struct QuotaDTO {
     pub reset_day: i64,
 }
 
-pub async fn list_peers(headers: HeaderMap, State(state): State<AppState>) -> impl IntoResponse {
+pub async fn list_peers(headers: HeaderMap, State(state): State<AppState>, Query(query): Query<ListPeersQuery>) -> impl IntoResponse {
     if get_current_user(&headers, &state).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
@@ -85,10 +100,10 @@ pub async fn list_peers(headers: HeaderMap, State(state): State<AppState>) -> im
     let day_key = counter_day_key(now_utc, tz);
     let month_key = now_utc.format("%Y-%m").to_string();
 
-    let mut stmt = conn.prepare(
-        r#"
+    let mut sql = r#"
         SELECT p.id, p.router_id, r.name, p.interface, p.ros_id, p.name, p.public_key, p.allowed_address,
                p.comment, p.disabled, p.selected, p.router_sync_status,
+               p.router_sync_first_seen_at, p.router_sync_last_seen_at,
                COALESCE(d.rx, 0), COALESCE(d.tx, 0),
                COALESCE(m.rx, 0), COALESCE(m.tx, 0),
                (SELECT COALESCE(SUM(rx), 0) FROM usage_monthly WHERE peer_id = p.id),
@@ -97,11 +112,46 @@ pub async fn list_peers(headers: HeaderMap, State(state): State<AppState>) -> im
         JOIN routers r ON p.router_id = r.id
         LEFT JOIN usage_daily d ON p.id = d.peer_id AND d.day = ?1
         LEFT JOIN usage_monthly m ON p.id = m.peer_id AND m.month_key = ?2
-        ORDER BY p.id ASC
-        "#,
-    ).unwrap();
+        WHERE 1=1
+    "#.to_string();
+
+    if query.selected_only.unwrap_or(false) {
+        sql.push_str(" AND p.selected = 1");
+    }
+    let mut router_id_list = Vec::new();
+    if let Some(r_id) = query.router_id {
+        router_id_list.push(r_id);
+    }
+    if let Some(ref rids_str) = query.router_ids {
+        for part in rids_str.split(',') {
+            if let Ok(id) = part.trim().parse::<i64>() {
+                if !router_id_list.contains(&id) {
+                    router_id_list.push(id);
+                }
+            }
+        }
+    }
+    if !router_id_list.is_empty() {
+        let in_clause = router_id_list.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        sql.push_str(&format!(" AND p.router_id IN ({})", in_clause));
+    }
+    if let Some(ref iface) = query.interface {
+        if !iface.is_empty() {
+            sql.push_str(&format!(" AND p.interface = '{}'", iface.replace('\'', "''")));
+        }
+    }
+    sql.push_str(" ORDER BY p.id ASC");
+
+    let mut stmt = conn.prepare(&sql).unwrap();
 
     let rows = stmt.query_map(params![day_key, month_key], |row| {
+        let today_rx: i64 = row.get(14)?;
+        let today_tx: i64 = row.get(15)?;
+        let month_rx: i64 = row.get(16)?;
+        let month_tx: i64 = row.get(17)?;
+        let alltime_rx: i64 = row.get(18)?;
+        let alltime_tx: i64 = row.get(19)?;
+
         Ok(PeerListDTO {
             id: row.get(0)?,
             router_id: row.get(1)?,
@@ -115,13 +165,20 @@ pub async fn list_peers(headers: HeaderMap, State(state): State<AppState>) -> im
             disabled: row.get(9)?,
             selected: row.get(10)?,
             router_sync_status: row.get(11)?,
-            today_rx: row.get(12)?,
-            today_tx: row.get(13)?,
-            month_rx: row.get(14)?,
-            month_tx: row.get(15)?,
-            alltime_rx: row.get(16)?,
-            alltime_tx: row.get(17)?,
+            router_sync_first_seen_at: row.get(12)?,
+            router_sync_last_seen_at: row.get(13)?,
+            today_rx,
+            today_tx,
+            month_rx,
+            month_tx,
+            alltime_rx,
+            alltime_tx,
+            current_rx: today_rx,
+            current_tx: today_tx,
+            total_rx: alltime_rx,
+            total_tx: alltime_tx,
             is_online: false,
+            online: false,
             last_handshake_ago: None,
         })
     }).unwrap();
@@ -316,6 +373,305 @@ pub async fn patch_peer_quota(headers: HeaderMap, State(state): State<AppState>,
     (StatusCode::OK, Json(payload)).into_response()
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct PeerUsageQuery {
+    pub window: Option<String>,
+    pub seconds: Option<i64>,
+    pub interval: Option<i64>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub all_time: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UsagePointDTO {
+    pub day: String,
+    pub rx: i64,
+    pub tx: i64,
+}
+
+pub async fn get_peer(headers: HeaderMap, State(state): State<AppState>, Path(peer_id): Path<i64>) -> impl IntoResponse {
+    if get_current_user(&headers, &state).await.is_none() {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let conn = match state.pool.get() {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+    };
+
+    let now_utc = Utc::now();
+    let tz = parse_timezone(&state.settings.timezone);
+    let day_key = counter_day_key(now_utc, tz);
+    let month_key = now_utc.format("%Y-%m").to_string();
+
+    let sql = r#"
+        SELECT p.id, p.router_id, r.name, p.interface, p.ros_id, p.name, p.public_key, p.allowed_address,
+               p.comment, p.disabled, p.selected, p.router_sync_status,
+               p.router_sync_first_seen_at, p.router_sync_last_seen_at,
+               COALESCE(d.rx, 0), COALESCE(d.tx, 0),
+               COALESCE(m.rx, 0), COALESCE(m.tx, 0),
+               (SELECT COALESCE(SUM(rx), 0) FROM usage_monthly WHERE peer_id = p.id),
+               (SELECT COALESCE(SUM(tx), 0) FROM usage_monthly WHERE peer_id = p.id)
+        FROM peers p
+        JOIN routers r ON p.router_id = r.id
+        LEFT JOIN usage_daily d ON p.id = d.peer_id AND d.day = ?1
+        LEFT JOIN usage_monthly m ON p.id = m.peer_id AND m.month_key = ?2
+        WHERE p.id = ?3
+    "#;
+
+    let res = conn.query_row(sql, params![day_key, month_key, peer_id], |row| {
+        let today_rx: i64 = row.get(14)?;
+        let today_tx: i64 = row.get(15)?;
+        let month_rx: i64 = row.get(16)?;
+        let month_tx: i64 = row.get(17)?;
+        let alltime_rx: i64 = row.get(18)?;
+        let alltime_tx: i64 = row.get(19)?;
+
+        Ok(PeerListDTO {
+            id: row.get(0)?,
+            router_id: row.get(1)?,
+            router_name: row.get(2)?,
+            interface: row.get(3)?,
+            ros_id: row.get(4)?,
+            name: row.get(5)?,
+            public_key: row.get(6)?,
+            allowed_address: row.get(7)?,
+            comment: row.get(8)?,
+            disabled: row.get(9)?,
+            selected: row.get(10)?,
+            router_sync_status: row.get(11)?,
+            router_sync_first_seen_at: row.get(12)?,
+            router_sync_last_seen_at: row.get(13)?,
+            today_rx,
+            today_tx,
+            month_rx,
+            month_tx,
+            alltime_rx,
+            alltime_tx,
+            current_rx: today_rx,
+            current_tx: today_tx,
+            total_rx: alltime_rx,
+            total_tx: alltime_tx,
+            is_online: false,
+            online: false,
+            last_handshake_ago: None,
+        })
+    });
+
+    match res {
+        Ok(dto) => (StatusCode::OK, Json(dto)).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Peer not found").into_response(),
+    }
+}
+
+pub async fn get_peer_usage(
+    headers: HeaderMap,
+    Path(peer_id): Path<i64>,
+    Query(query): Query<PeerUsageQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    if get_current_user(&headers, &state).await.is_none() {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let conn = match state.pool.get() {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+    };
+
+    let window = query.window.as_deref().unwrap_or("daily");
+    let now_utc = Utc::now();
+    let mut points = Vec::new();
+
+    if window == "raw" {
+        let seconds = query.seconds.unwrap_or(86400).max(60);
+        let start_str = query.start.unwrap_or_else(|| (now_utc - chrono::Duration::seconds(seconds)).format("%Y-%m-%d %H:%M:%S").to_string());
+        let end_str = query.end.unwrap_or_else(|| now_utc.format("%Y-%m-%d %H:%M:%S").to_string());
+
+        let mut stmt = match conn.prepare(
+            "SELECT minute_ts, rx, tx FROM usage_minute WHERE peer_id = ?1 AND minute_ts >= ?2 AND minute_ts <= ?3 ORDER BY minute_ts ASC"
+        ) {
+            Ok(s) => s,
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+        };
+
+        let rows = stmt.query_map(params![peer_id, start_str, end_str], |row| {
+            Ok(UsagePointDTO {
+                day: row.get(0)?,
+                rx: row.get(1)?,
+                tx: row.get(2)?,
+            })
+        });
+
+        if let Ok(iter) = rows {
+            for r in iter {
+                if let Ok(p) = r {
+                    points.push(p);
+                }
+            }
+        }
+    } else {
+        // Daily window
+        let mut stmt = match conn.prepare(
+            "SELECT day, rx, tx FROM usage_daily WHERE peer_id = ?1 ORDER BY day ASC"
+        ) {
+            Ok(s) => s,
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+        };
+
+        let rows = stmt.query_map(params![peer_id], |row| {
+            Ok(UsagePointDTO {
+                day: row.get(0)?,
+                rx: row.get(1)?,
+                tx: row.get(2)?,
+            })
+        });
+
+        if let Ok(iter) = rows {
+            for r in iter {
+                if let Ok(p) = r {
+                    points.push(p);
+                }
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(points)).into_response()
+}
+
+pub async fn reset_peer_metrics(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(peer_id): Path<i64>,
+) -> impl IntoResponse {
+    if get_current_user(&headers, &state).await.is_none() {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let conn = match state.pool.get() {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+    };
+
+    let deleted_samples = conn.execute("DELETE FROM usage_samples WHERE peer_id = ?1", params![peer_id]).unwrap_or(0);
+    let deleted_minutes = conn.execute("DELETE FROM usage_minute WHERE peer_id = ?1", params![peer_id]).unwrap_or(0);
+    let deleted_daily = conn.execute("DELETE FROM usage_daily WHERE peer_id = ?1", params![peer_id]).unwrap_or(0);
+    let deleted_monthly = conn.execute("DELETE FROM usage_monthly WHERE peer_id = ?1", params![peer_id]).unwrap_or(0);
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "deleted_samples": deleted_samples,
+        "deleted_minutes": deleted_minutes,
+        "deleted_daily": deleted_daily,
+        "deleted_monthly": deleted_monthly,
+    }))).into_response()
+}
+
+pub async fn get_peer_client_private_key(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(peer_id): Path<i64>,
+) -> impl IntoResponse {
+    if get_current_user(&headers, &state).await.is_none() {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let conn = match state.pool.get() {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+    };
+
+    let key = format!("peer_private_key:{}", peer_id);
+    let enc: Option<String> = conn.query_row(
+        "SELECT value FROM settings_kv WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    ).ok();
+
+    let priv_key = enc.and_then(|e| {
+        let sbox = SecretBox::new(&state.settings.secret_key);
+        sbox.decrypt(&e)
+    });
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "private_key": priv_key
+    }))).into_response()
+}
+
+pub async fn get_peer_client_export_prefs(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(peer_id): Path<i64>,
+) -> impl IntoResponse {
+    if get_current_user(&headers, &state).await.is_none() {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let conn = match state.pool.get() {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+    };
+
+    let get_pref = |suffix: &str| -> Option<String> {
+        conn.query_row(
+            "SELECT value FROM settings_kv WHERE key = ?1",
+            params![format!("{}:{}", suffix, peer_id)],
+            |r| r.get(0),
+        ).ok()
+    };
+
+    let endpoint = get_pref("peer_export_endpoint").unwrap_or_default();
+    let dns = get_pref("peer_export_dns").unwrap_or_else(|| "1.1.1.1, 8.8.8.8".to_string());
+    let mtu: i64 = get_pref("peer_export_mtu").and_then(|v| v.parse().ok()).unwrap_or(1420);
+    let persistent_keepalive: i64 = get_pref("peer_export_keepalive").and_then(|v| v.parse().ok()).unwrap_or(25);
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "endpoint": endpoint,
+        "dns": dns,
+        "mtu": mtu,
+        "persistent_keepalive": persistent_keepalive,
+    }))).into_response()
+}
+
+pub async fn reconcile_peer(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(peer_id): Path<i64>,
+) -> impl IntoResponse {
+    if get_current_user(&headers, &state).await.is_none() {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let conn = match state.pool.get() {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+    };
+
+    let peer = match get_peer_by_id(&conn, peer_id) {
+        Some(p) => p,
+        None => return (StatusCode::NOT_FOUND, "Peer not found").into_response(),
+    };
+
+    let router = match get_router_by_id(&conn, peer.router_id) {
+        Some(r) => r,
+        None => return (StatusCode::NOT_FOUND, "Router not found").into_response(),
+    };
+
+    let client = make_client(&router, &state.settings.secret_key, Some(10));
+    let live_peers = client.list_all_wireguard_peers().await.unwrap_or_default();
+    let live_matching = live_peers.into_iter().find(|lp| lp.interface == peer.interface && lp.public_key == peer.public_key);
+
+    if let Some(lp) = live_matching {
+        let _ = conn.execute(
+            "UPDATE peers SET ros_id = ?1, name = ?2, allowed_address = ?3, disabled = ?4, router_sync_status = 'synced' WHERE id = ?5",
+            params![lp.ros_id, lp.name, lp.allowed_address, lp.disabled, peer_id],
+        );
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "reconciled"}))).into_response()
+}
+
 fn get_peer_by_id(conn: &rusqlite::Connection, id: i64) -> Option<Peer> {
     conn.query_row(
         "SELECT id, router_id, interface, ros_id, name, public_key, allowed_address, comment, disabled, selected, router_sync_status FROM peers WHERE id = ?1",
@@ -357,4 +713,50 @@ fn get_router_by_id(conn: &rusqlite::Connection, id: i64) -> Option<Router> {
             ros_supported: row.get(10)?,
         }),
     ).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::schema::initialize_database;
+
+    #[test]
+    fn test_peer_retrieval_and_usage_queries() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let _ = initialize_database(&conn);
+
+        conn.execute(
+            "INSERT INTO routers (name, host, proto, port, username, secret_enc, tls_verify, enabled, ros_version, ros_supported) VALUES ('Router1', '192.168.88.1', 'rest', 443, 'admin', 'enc', 0, 1, '7.12', 1)",
+            [],
+        ).unwrap();
+
+        let now_s = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        conn.execute(
+            r#"
+            INSERT INTO peers (router_id, interface, ros_id, name, public_key, allowed_address, disabled, selected, router_sync_status, router_sync_first_seen_at, router_sync_last_seen_at)
+            VALUES (1, 'wg0', '*1', 'UserA', 'pub_key_A', '10.0.0.5/32', 0, 1, 'synced', ?1, ?1)
+            "#,
+            params![now_s],
+        ).unwrap();
+
+        let peer = get_peer_by_id(&conn, 1).expect("Peer should exist");
+        assert_eq!(peer.name, "UserA");
+        assert_eq!(peer.public_key, "pub_key_A");
+        assert_eq!(peer.router_sync_status, "synced");
+
+        // Insert minute usage
+        let min_s = Utc::now().format("%Y-%m-%d %H:%M:00").to_string();
+        conn.execute(
+            "INSERT INTO usage_minute (peer_id, minute_ts, rx, tx) VALUES (1, ?1, 4096, 8192)",
+            params![min_s],
+        ).unwrap();
+
+        let minute_row: (i64, i64) = conn.query_row(
+            "SELECT rx, tx FROM usage_minute WHERE peer_id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(minute_row.0, 4096);
+        assert_eq!(minute_row.1, 8192);
+    }
 }

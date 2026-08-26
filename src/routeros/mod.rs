@@ -8,6 +8,46 @@ use api::RouterOSApiClient;
 use rest::RouterOSRestClient;
 use serde::{Deserialize, Serialize};
 
+pub fn parse_last_handshake_str(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() || s == "0" || s == "never" || s == "none" {
+        return None;
+    }
+    if let Ok(num) = s.parse::<i64>() {
+        return if num > 0 { Some(num) } else { None };
+    }
+
+    let mut total_seconds: i64 = 0;
+    let mut current_num: i64 = 0;
+    let mut has_match = false;
+
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            current_num = current_num.saturating_mul(10).saturating_add(c as i64 - '0' as i64);
+        } else {
+            let mult = match c.to_ascii_lowercase() {
+                'w' => 604_800,
+                'd' => 86_400,
+                'h' => 3_600,
+                'm' => 60,
+                's' => 1,
+                _ => 0,
+            };
+            if mult > 0 && current_num > 0 {
+                total_seconds = total_seconds.saturating_add(current_num.saturating_mul(mult));
+                has_match = true;
+            }
+            current_num = 0;
+        }
+    }
+
+    if has_match && total_seconds > 0 {
+        Some(total_seconds)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WGPeer {
     pub ros_id: String,
@@ -198,5 +238,23 @@ impl AnyRouterOSClient {
             Self::Rest(c) => c.list_simple_queues(name_prefix).await,
             Self::Api(c) => c.list_simple_queues(name_prefix).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_last_handshake_str() {
+        assert_eq!(parse_last_handshake_str(""), None);
+        assert_eq!(parse_last_handshake_str("0"), None);
+        assert_eq!(parse_last_handshake_str("never"), None);
+        assert_eq!(parse_last_handshake_str("24s"), Some(24));
+        assert_eq!(parse_last_handshake_str("1m30s"), Some(90));
+        assert_eq!(parse_last_handshake_str("2h15m"), Some(8100));
+        assert_eq!(parse_last_handshake_str("3d"), Some(259200));
+        assert_eq!(parse_last_handshake_str("1w2d"), Some(777600));
+        assert_eq!(parse_last_handshake_str("45"), Some(45));
     }
 }

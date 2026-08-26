@@ -16,10 +16,13 @@ pub struct SettingsDTO {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MetricsDTO {
-    pub routers_count: i64,
-    pub peers_count: i64,
-    pub users_count: i64,
-    pub database_size_bytes: i64,
+    pub cpu_percent: Option<f64>,
+    pub load_1: Option<f64>,
+    pub load_5: Option<f64>,
+    pub load_15: Option<f64>,
+    pub mem_percent: Option<f64>,
+    pub mem_used: Option<i64>,
+    pub mem_total: Option<i64>,
 }
 
 pub async fn get_settings(headers: HeaderMap, State(state): State<AppState>) -> impl IntoResponse {
@@ -77,16 +80,57 @@ pub async fn get_metrics(headers: HeaderMap, State(state): State<AppState>) -> i
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
-    let conn = state.pool.get().unwrap();
-    let routers_count: i64 = conn.query_row("SELECT COUNT(*) FROM routers", [], |r| r.get(0)).unwrap_or(0);
-    let peers_count: i64 = conn.query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0)).unwrap_or(0);
-    let users_count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap_or(0);
-    let database_size_bytes: i64 = conn.query_row("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", [], |r| r.get(0)).unwrap_or(0);
+    let mut load_1 = None;
+    let mut load_5 = None;
+    let mut load_15 = None;
+    if let Ok(loadavg_str) = std::fs::read_to_string("/proc/loadavg") {
+        let parts: Vec<&str> = loadavg_str.split_whitespace().collect();
+        if parts.len() >= 3 {
+            load_1 = parts[0].parse::<f64>().ok();
+            load_5 = parts[1].parse::<f64>().ok();
+            load_15 = parts[2].parse::<f64>().ok();
+        }
+    }
+
+    let mut mem_total = None;
+    let mut mem_used = None;
+    let mut mem_percent = None;
+    if let Ok(meminfo_str) = std::fs::read_to_string("/proc/meminfo") {
+        let mut total_kb: Option<i64> = None;
+        let mut avail_kb: Option<i64> = None;
+        let mut free_kb: Option<i64> = None;
+
+        for line in meminfo_str.lines() {
+            if line.starts_with("MemTotal:") {
+                total_kb = line.split_whitespace().nth(1).and_then(|v| v.parse().ok());
+            } else if line.starts_with("MemAvailable:") {
+                avail_kb = line.split_whitespace().nth(1).and_then(|v| v.parse().ok());
+            } else if line.starts_with("MemFree:") {
+                free_kb = line.split_whitespace().nth(1).and_then(|v| v.parse().ok());
+            }
+        }
+
+        if let Some(tot) = total_kb {
+            let tot_bytes = tot.saturating_mul(1024);
+            mem_total = Some(tot_bytes);
+            let free = avail_kb.or(free_kb).unwrap_or(0);
+            let used_bytes = tot.saturating_sub(free).saturating_mul(1024);
+            mem_used = Some(used_bytes);
+            if tot > 0 {
+                mem_percent = Some(((tot.saturating_sub(free)) as f64 / tot as f64) * 100.0);
+            }
+        }
+    }
+
+    let cpu_percent = load_1.map(|l| (l * 10.0).min(100.0));
 
     (StatusCode::OK, Json(MetricsDTO {
-        routers_count,
-        peers_count,
-        users_count,
-        database_size_bytes,
+        cpu_percent,
+        load_1,
+        load_5,
+        load_15,
+        mem_percent,
+        mem_used,
+        mem_total,
     })).into_response()
 }

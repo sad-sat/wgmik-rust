@@ -3,7 +3,7 @@ use crate::crypto::SecretBox;
 use crate::db::models::Router;
 use crate::routeros::factory::make_client;
 use crate::routeros::version::is_routeros_supported;
-use axum::extract::{Json, Path, State};
+use axum::extract::{Json, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use chrono::Utc;
@@ -61,9 +61,75 @@ pub struct RouterDeleteImpactDTO {
     pub samples_count: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImportPeersReq {
-    pub public_keys: Vec<String>,
+#[derive(Debug, Default, Deserialize)]
+pub struct RouterPeersQuery {
+    pub interface: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerImportItem {
+    #[serde(default)]
+    pub interface: Option<String>,
+    #[serde(default)]
+    pub public_key: String,
+    #[serde(default)]
+    pub selected: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PeerImportEntry {
+    Item(PeerImportItem),
+    Tuple(String, String),
+    Key(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ImportPeersReq {
+    List(Vec<PeerImportEntry>),
+    ObjectItems { items: Vec<PeerImportEntry> },
+    ObjectPeers { peers: Vec<PeerImportEntry> },
+    ObjectKeys { public_keys: Vec<String> },
+    Single(PeerImportEntry),
+}
+
+impl ImportPeersReq {
+    pub fn into_items(self) -> Vec<PeerImportItem> {
+        let entries = match self {
+            ImportPeersReq::List(list) => list,
+            ImportPeersReq::ObjectItems { items } => items,
+            ImportPeersReq::ObjectPeers { peers } => peers,
+            ImportPeersReq::ObjectKeys { public_keys } => {
+                return public_keys
+                    .into_iter()
+                    .map(|k| PeerImportItem {
+                        interface: None,
+                        public_key: k,
+                        selected: Some(true),
+                    })
+                    .collect();
+            }
+            ImportPeersReq::Single(entry) => vec![entry],
+        };
+
+        entries
+            .into_iter()
+            .map(|entry| match entry {
+                PeerImportEntry::Item(item) => item,
+                PeerImportEntry::Tuple(iface, key) => PeerImportItem {
+                    interface: Some(iface),
+                    public_key: key,
+                    selected: Some(true),
+                },
+                PeerImportEntry::Key(key) => PeerImportItem {
+                    interface: None,
+                    public_key: key,
+                    selected: Some(true),
+                },
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -350,7 +416,12 @@ pub async fn get_router_interface(headers: HeaderMap, State(state): State<AppSta
     }
 }
 
-pub async fn list_router_peers(headers: HeaderMap, State(state): State<AppState>, Path(router_id): Path<i64>) -> impl IntoResponse {
+pub async fn list_router_peers(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(router_id): Path<i64>,
+    Query(query): Query<RouterPeersQuery>,
+) -> impl IntoResponse {
     if get_current_user(&headers, &state).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
@@ -362,13 +433,23 @@ pub async fn list_router_peers(headers: HeaderMap, State(state): State<AppState>
     };
 
     let client = make_client(&router, &state.settings.secret_key, Some(10));
-    match client.list_all_wireguard_peers().await {
+    let peers_res = match &query.interface {
+        Some(iface) if !iface.is_empty() => client.list_wireguard_peers(iface).await,
+        _ => client.list_all_wireguard_peers().await,
+    };
+
+    match peers_res {
         Ok(peers) => (StatusCode::OK, Json(peers)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 
-pub async fn import_router_peers(headers: HeaderMap, State(state): State<AppState>, Path(router_id): Path<i64>, Json(payload): Json<ImportPeersReq>) -> impl IntoResponse {
+pub async fn import_router_peers(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(router_id): Path<i64>,
+    Json(payload): Json<ImportPeersReq>,
+) -> impl IntoResponse {
     if get_current_user(&headers, &state).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
@@ -385,24 +466,59 @@ pub async fn import_router_peers(headers: HeaderMap, State(state): State<AppStat
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
 
+    let items = payload.into_items();
     let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut imported = 0;
-    for lp in live_peers {
-        if payload.public_keys.contains(&lp.public_key) {
-            let _ = conn.execute(
+
+    for it in items {
+        let matching_live = live_peers.iter().find(|lp| {
+            if let Some(ref iface) = it.interface {
+                if !iface.is_empty() && lp.interface != *iface {
+                    return false;
+                }
+            }
+            lp.public_key == it.public_key
+        });
+
+        if let Some(lp) = matching_live {
+            let selected_val = if it.selected.unwrap_or(true) { 1 } else { 0 };
+            let disabled_val = if lp.disabled { 1 } else { 0 };
+            let comment_val = lp.comment.as_deref().unwrap_or("");
+
+            let res = conn.execute(
                 r#"
-                INSERT INTO peers (router_id, interface, ros_id, name, public_key, allowed_address, disabled, selected, router_sync_status, router_sync_first_seen_at, router_sync_last_seen_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'synced', ?8, ?8)
+                INSERT INTO peers (
+                    router_id, interface, ros_id, name, public_key, allowed_address,
+                    comment, disabled, selected, router_sync_status,
+                    router_sync_first_seen_at, router_sync_last_seen_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'synced', ?10, ?10)
                 ON CONFLICT(router_id, interface, public_key) DO UPDATE SET
-                    selected = 1,
+                    selected = excluded.selected,
+                    disabled = excluded.disabled,
                     router_sync_status = 'synced',
+                    router_sync_last_seen_at = excluded.router_sync_last_seen_at,
                     ros_id = excluded.ros_id,
                     name = excluded.name,
-                    allowed_address = excluded.allowed_address
+                    allowed_address = excluded.allowed_address,
+                    comment = excluded.comment
                 "#,
-                params![router_id, lp.interface, lp.ros_id, lp.name, lp.public_key, lp.allowed_address, lp.disabled, now_str],
+                params![
+                    router_id,
+                    lp.interface,
+                    lp.ros_id,
+                    lp.name,
+                    lp.public_key,
+                    lp.allowed_address,
+                    comment_val,
+                    disabled_val,
+                    selected_val,
+                    now_str,
+                ],
             );
-            imported += 1;
+            if res.is_ok() {
+                imported += 1;
+            }
         }
     }
 
@@ -475,4 +591,53 @@ fn get_router_by_id(conn: &rusqlite::Connection, id: i64) -> Option<Router> {
             ros_supported: row.get(10)?,
         }),
     ).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deserialize_peer_import_item_list() {
+        let json_str = r#"[
+            {"interface": "wg0", "public_key": "pub1", "selected": true},
+            {"interface": "wg0", "public_key": "pub2", "selected": false}
+        ]"#;
+        let req: ImportPeersReq = serde_json::from_str(json_str).unwrap();
+        let items = req.into_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].interface.as_deref(), Some("wg0"));
+        assert_eq!(items[0].public_key, "pub1");
+        assert_eq!(items[0].selected, Some(true));
+        assert_eq!(items[1].selected, Some(false));
+    }
+
+    #[test]
+    fn test_deserialize_string_key_list() {
+        let json_str = r#"["pub1", "pub2"]"#;
+        let req: ImportPeersReq = serde_json::from_str(json_str).unwrap();
+        let items = req.into_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].public_key, "pub1");
+        assert_eq!(items[0].selected, Some(true));
+    }
+
+    #[test]
+    fn test_deserialize_object_public_keys() {
+        let json_str = r#"{"public_keys": ["pub1", "pub2"]}"#;
+        let req: ImportPeersReq = serde_json::from_str(json_str).unwrap();
+        let items = req.into_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].public_key, "pub1");
+    }
+
+    #[test]
+    fn test_deserialize_object_items() {
+        let json_str = r#"{"items": [{"interface": "wg1", "public_key": "pub1", "selected": true}]}"#;
+        let req: ImportPeersReq = serde_json::from_str(json_str).unwrap();
+        let items = req.into_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].interface.as_deref(), Some("wg1"));
+        assert_eq!(items[0].public_key, "pub1");
+    }
 }
