@@ -253,6 +253,12 @@ impl TelegramBot {
         self.running.store(true, Ordering::SeqCst);
         info!("Telegram bot polling started");
 
+        // Clear any existing webhook so getUpdates polling works cleanly
+        let _ = self.client.post(&self.api_url("deleteWebhook"))
+            .json(&json!({ "drop_pending_updates": false }))
+            .send()
+            .await;
+
         self.sync_bot_commands().await;
 
         let mut offset: i64 = 0;
@@ -261,22 +267,34 @@ impl TelegramBot {
             match self.client.get(&url).send().await {
                 Ok(resp) => {
                     if let Ok(data) = resp.json::<Value>().await {
-                        if let Some(results) = data.get("result").and_then(|v| v.as_array()) {
-                            for update in results {
-                                if let Some(update_id) = update.get("update_id").and_then(|v| v.as_i64()) {
-                                    offset = update_id + 1;
+                        if data.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            if let Some(results) = data.get("result").and_then(|v| v.as_array()) {
+                                for update in results {
+                                    if let Some(update_id) = update.get("update_id").and_then(|v| v.as_i64()) {
+                                        offset = update_id + 1;
+                                    }
+                                    let bot = self.clone();
+                                    let update_clone = update.clone();
+                                    tokio::spawn(async move {
+                                        bot.handle_update(update_clone).await;
+                                    });
                                 }
-                                let bot = self.clone();
-                                let update_clone = update.clone();
-                                tokio::spawn(async move {
-                                    bot.handle_update(update_clone).await;
-                                });
                             }
+                        } else {
+                            let desc = data.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown Telegram error");
+                            warn!("Telegram getUpdates rejected: {}", desc);
+                            if desc.contains("webhook is active") {
+                                let _ = self.client.post(&self.api_url("deleteWebhook"))
+                                    .json(&json!({ "drop_pending_updates": false }))
+                                    .send()
+                                    .await;
+                            }
+                            sleep(Duration::from_secs(3)).await;
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("Telegram polling error: {}", e);
+                    warn!("Telegram polling network error: {}", e);
                     sleep(Duration::from_secs(3)).await;
                 }
             }
@@ -573,7 +591,7 @@ impl TelegramBot {
                 let today_utc = Utc::now().date_naive().format("%Y-%m-%d").to_string();
                 peers.into_iter().map(|peer| {
                     let (rx, tx) = conn.query_row(
-                        "SELECT rx_bytes, tx_bytes FROM peer_usage_daily WHERE peer_id = ?1 AND date = ?2",
+                        "SELECT rx, tx FROM usage_daily WHERE peer_id = ?1 AND day = ?2",
                         params![peer.id, today_utc],
                         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                     ).unwrap_or((0, 0));
@@ -632,8 +650,8 @@ impl TelegramBot {
                 let month_prefix = Utc::now().date_naive().format("%Y-%m").to_string();
                 peers.into_iter().map(|peer| {
                     let points: Vec<(String, i64, i64)> = match conn.prepare(
-                        "SELECT date, rx_bytes, tx_bytes FROM peer_usage_daily
-                         WHERE peer_id = ?1 AND date LIKE ?2 ORDER BY date ASC",
+                        "SELECT day, rx, tx FROM usage_daily
+                         WHERE peer_id = ?1 AND day LIKE ?2 ORDER BY day ASC",
                     ) {
                         Ok(mut stmt) => {
                             stmt.query_map(params![peer.id, format!("{}%", month_prefix)], |row| {
@@ -697,7 +715,7 @@ impl TelegramBot {
             } else {
                 peers.into_iter().map(|peer| {
                     let totals: (i64, i64) = conn.query_row(
-                        "SELECT COALESCE(SUM(rx_bytes), 0), COALESCE(SUM(tx_bytes), 0) FROM peer_usage_daily WHERE peer_id = ?1",
+                        "SELECT COALESCE(SUM(rx), 0), COALESCE(SUM(tx), 0) FROM usage_daily WHERE peer_id = ?1",
                         params![peer.id],
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     ).unwrap_or((0, 0));
@@ -1048,21 +1066,21 @@ impl TelegramBot {
                 let (rx, tx) = match scope {
                     "today" => {
                         conn.query_row(
-                            "SELECT rx_bytes, tx_bytes FROM peer_usage_daily WHERE peer_id = ?1 AND date = ?2",
+                            "SELECT rx, tx FROM usage_daily WHERE peer_id = ?1 AND day = ?2",
                             params![pid, today_utc],
                             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
                         ).unwrap_or((0, 0))
                     },
                     "monthly" => {
                         conn.query_row(
-                            "SELECT COALESCE(SUM(rx_bytes), 0), COALESCE(SUM(tx_bytes), 0) FROM peer_usage_daily WHERE peer_id = ?1 AND date LIKE ?2",
+                            "SELECT COALESCE(SUM(rx), 0), COALESCE(SUM(tx), 0) FROM usage_daily WHERE peer_id = ?1 AND day LIKE ?2",
                             params![pid, format!("{}%", month_prefix)],
                             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
                         ).unwrap_or((0, 0))
                     },
                     _ => {
                         conn.query_row(
-                            "SELECT COALESCE(SUM(rx_bytes), 0), COALESCE(SUM(tx_bytes), 0) FROM peer_usage_daily WHERE peer_id = ?1",
+                            "SELECT COALESCE(SUM(rx), 0), COALESCE(SUM(tx), 0) FROM usage_daily WHERE peer_id = ?1",
                             params![pid],
                             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
                         ).unwrap_or((0, 0))
