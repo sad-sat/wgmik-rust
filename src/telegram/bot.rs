@@ -2,7 +2,6 @@ use super::fair_usage_card::generate_fair_usage_card_svg;
 use super::i18n::t;
 use super::svg_render::{fmt_bytes, render_svg_to_png};
 use super::usage_chart::generate_usage_chart_svg;
-use crate::accounting::deltas::counter_day_key;
 use crate::calendar::parse_timezone;
 use crate::db::models::Peer;
 use crate::db::DbPool;
@@ -124,9 +123,99 @@ impl TelegramBot {
         Ok(())
     }
 
+    pub async fn sync_bot_commands(&self) {
+        let cmds = json!({
+            "commands": [
+                { "command": "start", "description": "Start the bot / Home" },
+                { "command": "home", "description": "Main menu" },
+                { "command": "today", "description": "Today's bandwidth usage" },
+                { "command": "monthly", "description": "Monthly usage" },
+                { "command": "alltime", "description": "All-time usage" },
+                { "command": "fair", "description": "Fair usage policy & status" },
+                { "command": "settings", "description": "Language & preferences" }
+            ]
+        });
+        let _ = self.client.post(&self.api_url("setMyCommands")).json(&cmds).send().await;
+
+        let conn = match self.pool.get() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let raw: String = conn.query_row(
+            "SELECT value FROM settings_kv WHERE key = 'tg_admin_chat_id'",
+            [],
+            |r| r.get(0),
+        ).unwrap_or_default();
+        let clean = raw.trim().trim_start_matches('@');
+        if let Ok(admin_id) = clean.parse::<i64>() {
+            let admin_cmds = json!({
+                "commands": [
+                    { "command": "start", "description": "Start the bot / Home" },
+                    { "command": "home", "description": "Main menu" },
+                    { "command": "today", "description": "Today's bandwidth usage" },
+                    { "command": "monthly", "description": "Monthly usage" },
+                    { "command": "alltime", "description": "All-time usage" },
+                    { "command": "fair", "description": "Fair usage policy & status" },
+                    { "command": "settings", "description": "Language & preferences" },
+                    { "command": "admin", "description": "🛡️ Admin dashboard" }
+                ],
+                "scope": {
+                    "type": "chat",
+                    "chat_id": admin_id
+                }
+            });
+            let _ = self.client.post(&self.api_url("setMyCommands")).json(&admin_cmds).send().await;
+        }
+    }
+
+    pub fn is_admin(&self, tg_user_id: i64, username: Option<&str>) -> bool {
+        let conn = match self.pool.get() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let raw: String = conn.query_row(
+            "SELECT value FROM settings_kv WHERE key = 'tg_admin_chat_id'",
+            [],
+            |r| r.get(0),
+        ).unwrap_or_default();
+
+        let clean = raw.trim().trim_start_matches('@').trim_matches('"').trim_matches('\'');
+        if clean.is_empty() {
+            return false;
+        }
+
+        if let Ok(admin_id) = clean.parse::<i64>() {
+            if admin_id == tg_user_id {
+                return true;
+            }
+        }
+
+        if let Some(uname) = username {
+            if !uname.is_empty() && uname.trim_start_matches('@').eq_ignore_ascii_case(clean) {
+                return true;
+            }
+        }
+
+        let db_uname: Option<String> = conn.query_row(
+            "SELECT telegram_username FROM telegram_users WHERE telegram_user_id = ?1",
+            params![tg_user_id],
+            |r| r.get(0),
+        ).ok();
+
+        if let Some(u) = db_uname {
+            if !u.is_empty() && u.trim_start_matches('@').eq_ignore_ascii_case(clean) {
+                return true;
+            }
+        }
+
+        false
+    }
+
     pub async fn start_polling(self: Arc<Self>) {
         self.running.store(true, Ordering::SeqCst);
         info!("Telegram bot polling started");
+
+        self.sync_bot_commands().await;
 
         let mut offset: i64 = 0;
         while self.running.load(Ordering::SeqCst) {
@@ -181,20 +270,17 @@ impl TelegramBot {
         let first_name = from.and_then(|f| f.get("first_name")).and_then(|v| v.as_str()).unwrap_or("");
         let last_name = from.and_then(|f| f.get("last_name")).and_then(|v| v.as_str()).unwrap_or("");
 
-        // Ensure user in DB
         let lang = self.ensure_telegram_user(tg_user_id, username, first_name, last_name);
 
         if text.starts_with("/start") {
             let parts: Vec<&str> = text.split_whitespace().collect();
             if parts.len() > 1 {
-                // Token signup deep-link
-                let token = parts[1];
-                self.handle_signup_token(chat_id, tg_user_id, token, &lang).await;
+                self.handle_signup_token(chat_id, tg_user_id, parts[1], &lang).await;
             } else {
-                self.send_home_menu(chat_id, &lang).await;
+                self.send_home_menu(chat_id, tg_user_id, &lang).await;
             }
         } else if text == "/home" {
-            self.send_home_menu(chat_id, &lang).await;
+            self.send_home_menu(chat_id, tg_user_id, &lang).await;
         } else if text == "/today" {
             self.send_today_usage(chat_id, tg_user_id, &lang).await;
         } else if text == "/monthly" {
@@ -205,10 +291,10 @@ impl TelegramBot {
             self.send_fair_usage(chat_id, tg_user_id, &lang).await;
         } else if text == "/settings" {
             self.send_settings_menu(chat_id, &lang).await;
-        } else if text == "/admin" {
+        } else if text == "/admin" || text.starts_with("/admin") {
             self.send_admin_menu(chat_id, tg_user_id, &lang).await;
         } else {
-            self.send_home_menu(chat_id, &lang).await;
+            self.send_home_menu(chat_id, tg_user_id, &lang).await;
         }
     }
 
@@ -224,7 +310,7 @@ impl TelegramBot {
         let _ = self.answer_callback_query(id, None).await;
 
         if data == "menu:home" {
-            self.send_home_menu(chat_id, &lang).await;
+            self.send_home_menu(chat_id, tg_user_id, &lang).await;
         } else if data == "menu:today" {
             self.send_today_usage(chat_id, tg_user_id, &lang).await;
         } else if data == "menu:monthly" {
@@ -235,19 +321,39 @@ impl TelegramBot {
             self.send_fair_usage(chat_id, tg_user_id, &lang).await;
         } else if data == "menu:settings" {
             self.send_settings_menu(chat_id, &lang).await;
+        } else if data == "menu:admin" || data == "adm:menu" {
+            self.send_admin_menu(chat_id, tg_user_id, &lang).await;
+        } else if data.starts_with("adm:users:") {
+            let page: i64 = data.strip_prefix("adm:users:").unwrap_or("0").parse().unwrap_or(0);
+            self.send_admin_users(chat_id, tg_user_id, page, &lang).await;
+        } else if data.starts_with("adm:user:") {
+            let uid: i64 = data.strip_prefix("adm:user:").unwrap_or("0").parse().unwrap_or(0);
+            self.send_admin_user_detail(chat_id, tg_user_id, uid, &lang).await;
+        } else if data.starts_with("adm:toggle_block:") {
+            let uid: i64 = data.strip_prefix("adm:toggle_block:").unwrap_or("0").parse().unwrap_or(0);
+            self.toggle_user_block(chat_id, tg_user_id, uid, &lang).await;
+        } else if data.starts_with("adm:peers:") {
+            let scope = data.strip_prefix("adm:peers:").unwrap_or("alltime");
+            self.send_admin_peers_usage(chat_id, tg_user_id, scope, &lang).await;
+        } else if data.starts_with("adm:outbox:") {
+            let page: i64 = data.strip_prefix("adm:outbox:").unwrap_or("0").parse().unwrap_or(0);
+            self.send_admin_outbox(chat_id, tg_user_id, page, &lang).await;
         } else if data == "lang:en" {
             self.set_user_language(tg_user_id, "en");
             let _ = self.send_message(chat_id, &t("lang_changed", "en"), None).await;
-            self.send_home_menu(chat_id, "en").await;
+            self.send_home_menu(chat_id, tg_user_id, "en").await;
         } else if data == "lang:fa" {
             self.set_user_language(tg_user_id, "fa");
             let _ = self.send_message(chat_id, &t("lang_changed", "fa"), None).await;
-            self.send_home_menu(chat_id, "fa").await;
+            self.send_home_menu(chat_id, tg_user_id, "fa").await;
         }
     }
 
     fn ensure_telegram_user(&self, tg_user_id: i64, username: &str, first_name: &str, last_name: &str) -> String {
-        let conn = self.pool.get().unwrap();
+        let conn = match self.pool.get() {
+            Ok(c) => c,
+            Err(_) => return "en".to_string(),
+        };
         let existing = conn.query_row(
             "SELECT language FROM telegram_users WHERE telegram_user_id = ?1",
             params![tg_user_id],
@@ -271,7 +377,10 @@ impl TelegramBot {
     }
 
     fn get_user_language(&self, tg_user_id: i64) -> String {
-        let conn = self.pool.get().unwrap();
+        let conn = match self.pool.get() {
+            Ok(c) => c,
+            Err(_) => return "en".to_string(),
+        };
         conn.query_row(
             "SELECT language FROM telegram_users WHERE telegram_user_id = ?1",
             params![tg_user_id],
@@ -280,30 +389,42 @@ impl TelegramBot {
     }
 
     fn set_user_language(&self, tg_user_id: i64, lang: &str) {
-        let conn = self.pool.get().unwrap();
+        let conn = match self.pool.get() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
         let _ = conn.execute(
             "UPDATE telegram_users SET language = ?1 WHERE telegram_user_id = ?2",
             params![lang, tg_user_id],
         );
     }
 
-    async fn send_home_menu(&self, chat_id: i64, lang: &str) {
+    async fn send_home_menu(&self, chat_id: i64, tg_user_id: i64, lang: &str) {
+        let is_adm = self.is_admin(tg_user_id, None);
         let text = t("welcome", lang);
-        let keyboard = json!({
-            "inline_keyboard": [
-                [
-                    { "text": format!("📊 {}", t("btn_today", lang)), "callback_data": "menu:today" },
-                    { "text": format!("📅 {}", t("btn_monthly", lang)), "callback_data": "menu:monthly" }
-                ],
-                [
-                    { "text": format!("📈 {}", t("btn_alltime", lang)), "callback_data": "menu:alltime" },
-                    { "text": format!("⚖️ {}", t("btn_fair_usage", lang)), "callback_data": "menu:fair" }
-                ],
-                [
-                    { "text": format!("⚙️ {}", t("btn_settings", lang)), "callback_data": "menu:settings" }
-                ]
-            ]
-        });
+        let mut keyboard_rows = vec![
+            vec![
+                json!({ "text": format!("📊 {}", t("btn_today", lang)), "callback_data": "menu:today" }),
+                json!({ "text": format!("📅 {}", t("btn_monthly", lang)), "callback_data": "menu:monthly" }),
+            ],
+            vec![
+                json!({ "text": format!("📈 {}", t("btn_alltime", lang)), "callback_data": "menu:alltime" }),
+                json!({ "text": format!("⚖️ {}", t("btn_fair_usage", lang)), "callback_data": "menu:fair" }),
+            ],
+        ];
+
+        if is_adm {
+            keyboard_rows.push(vec![
+                json!({ "text": "🛡️ Admin Panel", "callback_data": "adm:menu" }),
+                json!({ "text": format!("⚙️ {}", t("btn_settings", lang)), "callback_data": "menu:settings" }),
+            ]);
+        } else {
+            keyboard_rows.push(vec![
+                json!({ "text": format!("⚙️ {}", t("btn_settings", lang)), "callback_data": "menu:settings" }),
+            ]);
+        }
+
+        let keyboard = json!({ "inline_keyboard": keyboard_rows });
         let _ = self.send_message(chat_id, &text, Some(keyboard)).await;
     }
 
@@ -324,132 +445,186 @@ impl TelegramBot {
     }
 
     async fn handle_signup_token(&self, chat_id: i64, tg_user_id: i64, token: &str, lang: &str) {
-        let conn = self.pool.get().unwrap();
-        let token_row = conn.query_row(
-            "SELECT id, peer_ids, used_at, single_use FROM telegram_signup_tokens WHERE token = ?1",
-            params![token],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, bool>(3)?)),
-        );
+        enum SignupResult {
+            Used,
+            Success(usize),
+            Invalid,
+        }
 
-        match token_row {
-            Ok((token_id, peer_ids_json, used_at, single_use)) => {
-                if used_at.is_some() && single_use {
-                    let _ = self.send_message(chat_id, &t("token_used", lang), None).await;
-                    return;
+        let result = {
+            let conn = match self.pool.get() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let token_row = conn.query_row(
+                "SELECT id, peer_ids, used_at, single_use FROM telegram_signup_tokens WHERE token = ?1",
+                params![token],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, bool>(3)?)),
+            );
+
+            match token_row {
+                Ok((token_id, peer_ids_json, used_at, single_use)) => {
+                    if used_at.is_some() && single_use {
+                        SignupResult::Used
+                    } else {
+                        let db_user_id = conn.query_row(
+                            "SELECT id FROM telegram_users WHERE telegram_user_id = ?1",
+                            params![tg_user_id],
+                            |row| row.get::<_, i64>(0),
+                        ).unwrap_or(0);
+
+                        let peer_ids: Vec<i64> = serde_json::from_str(&peer_ids_json).unwrap_or_default();
+                        for pid in &peer_ids {
+                            let _ = conn.execute(
+                                "INSERT INTO telegram_peer_bindings (telegram_user_id, peer_id, visible)
+                                 VALUES (?1, ?2, 1) ON CONFLICT(telegram_user_id, peer_id) DO UPDATE SET visible = 1",
+                                params![db_user_id, pid],
+                            );
+                        }
+
+                        let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                        let _ = conn.execute(
+                            "UPDATE telegram_signup_tokens SET used_by = ?1, used_at = ?2 WHERE id = ?3",
+                            params![db_user_id, now_str, token_id],
+                        );
+
+                        SignupResult::Success(peer_ids.len())
+                    }
                 }
-
-                // Get telegram_users.id
-                let db_user_id = conn.query_row(
-                    "SELECT id FROM telegram_users WHERE telegram_user_id = ?1",
-                    params![tg_user_id],
-                    |row| row.get::<_, i64>(0),
-                ).unwrap_or(0);
-
-                let peer_ids: Vec<i64> = serde_json::from_str(&peer_ids_json).unwrap_or_default();
-                for pid in &peer_ids {
-                    let _ = conn.execute(
-                        "INSERT INTO telegram_peer_bindings (telegram_user_id, peer_id, visible) VALUES (?1, ?2, 1)
-                         ON CONFLICT(telegram_user_id, peer_id) DO NOTHING",
-                        params![db_user_id, pid],
-                    );
-                }
-
-                let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                let _ = conn.execute(
-                    "UPDATE telegram_signup_tokens SET used_by = ?1, used_at = ?2 WHERE id = ?3",
-                    params![db_user_id, now_str, token_id],
-                );
-
-                let welcome_msg = t("welcome_signup", lang).replace("{count}", &peer_ids.len().to_string());
-                let _ = self.send_message(chat_id, &welcome_msg, None).await;
-                self.send_home_menu(chat_id, lang).await;
+                Err(_) => SignupResult::Invalid,
             }
-            Err(_) => {
+        };
+
+        match result {
+            SignupResult::Used => {
+                let _ = self.send_message(chat_id, &t("token_used", lang), None).await;
+            }
+            SignupResult::Success(count) => {
+                let welcome_msg = t("welcome_signup", lang).replace("{count}", &count.to_string());
+                let _ = self.send_message(chat_id, &welcome_msg, None).await;
+                self.send_home_menu(chat_id, tg_user_id, lang).await;
+            }
+            SignupResult::Invalid => {
                 let _ = self.send_message(chat_id, &t("token_invalid", lang), None).await;
             }
         }
     }
 
     async fn send_today_usage(&self, chat_id: i64, tg_user_id: i64, lang: &str) {
-        let conn = self.pool.get().unwrap();
-        let peers = self.get_user_peers(&conn, tg_user_id);
-        if peers.is_empty() {
+        let items: Vec<(String, i64, i64)> = {
+            let conn = match self.pool.get() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let peers = self.get_user_peers(&conn, tg_user_id);
+            if peers.is_empty() {
+                Vec::new()
+            } else {
+                let today_utc = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+                peers.into_iter().map(|peer| {
+                    let (rx, tx) = conn.query_row(
+                        "SELECT rx_bytes, tx_bytes FROM peer_usage_daily WHERE peer_id = ?1 AND date = ?2",
+                        params![peer.id, today_utc],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    ).unwrap_or((0, 0));
+                    let peer_name = if !peer.name.is_empty() { peer.name } else { peer.interface };
+                    (peer_name, rx, tx)
+                }).collect()
+            }
+        };
+
+        if items.is_empty() {
             let _ = self.send_message(chat_id, &t("no_peers", lang), None).await;
             return;
         }
 
-        let now_utc = Utc::now();
-        let tz = parse_timezone("UTC");
-        let day_key = counter_day_key(now_utc, tz);
-
-        for peer in peers {
-            let daily = conn.query_row(
-                "SELECT rx, tx FROM usage_daily WHERE peer_id = ?1 AND day = ?2",
-                params![peer.id, day_key],
-                |row| Ok((row.get::<_, i64>(0).unwrap_or(0), row.get::<_, i64>(1).unwrap_or(0))),
-            ).unwrap_or((0, 0));
-
-            let title = t("today_title", lang);
-            let peer_name = if !peer.name.is_empty() { &peer.name } else { &peer.interface };
-            let svg = generate_usage_chart_svg(&title, peer_name, daily.0, daily.1, &[(day_key.clone(), daily.0, daily.1)]);
-
+        let title = t("today_title", lang);
+        for (peer_name, rx, tx) in items {
+            let svg = generate_usage_chart_svg(&title, &peer_name, rx, tx, &[("Today".to_string(), rx, tx)]);
             if let Ok(png) = render_svg_to_png(&svg, 2.0) {
                 let caption = format!("📊 <b>{}</b> - {}\n⬇️ {}\n⬆️ {}\n📈 Total: {}",
-                    title, peer_name, fmt_bytes(daily.0), fmt_bytes(daily.1), fmt_bytes(daily.0 + daily.1));
+                    title, peer_name, fmt_bytes(rx), fmt_bytes(tx), fmt_bytes(rx + tx));
                 let _ = self.send_photo(chat_id, png, &caption, None).await;
             }
         }
     }
 
     async fn send_monthly_usage(&self, chat_id: i64, tg_user_id: i64, lang: &str) {
-        let conn = self.pool.get().unwrap();
-        let peers = self.get_user_peers(&conn, tg_user_id);
-        if peers.is_empty() {
+        let items: Vec<(String, (i64, i64), Vec<(String, i64, i64)>)> = {
+            let conn = match self.pool.get() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let peers = self.get_user_peers(&conn, tg_user_id);
+            if peers.is_empty() {
+                Vec::new()
+            } else {
+                let month_prefix = Utc::now().date_naive().format("%Y-%m").to_string();
+                peers.into_iter().map(|peer| {
+                    let points: Vec<(String, i64, i64)> = match conn.prepare(
+                        "SELECT date, rx_bytes, tx_bytes FROM peer_usage_daily
+                         WHERE peer_id = ?1 AND date LIKE ?2 ORDER BY date ASC",
+                    ) {
+                        Ok(mut stmt) => {
+                            stmt.query_map(params![peer.id, format!("{}%", month_prefix)], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+                            }).unwrap().flatten().collect()
+                        }
+                        Err(_) => Vec::new(),
+                    };
+                    let totals = points.iter().fold((0i64, 0i64), |acc, p| (acc.0 + p.1, acc.1 + p.2));
+                    let peer_name = if !peer.name.is_empty() { peer.name } else { peer.interface };
+                    (peer_name, totals, points)
+                }).collect()
+            }
+        };
+
+        if items.is_empty() {
             let _ = self.send_message(chat_id, &t("no_peers", lang), None).await;
             return;
         }
 
-        let now_utc = Utc::now();
-        let month_key = now_utc.format("%Y-%m").to_string();
-
-        for peer in peers {
-            let monthly = conn.query_row(
-                "SELECT rx, tx FROM usage_monthly WHERE peer_id = ?1 AND month_key = ?2",
-                params![peer.id, month_key],
-                |row| Ok((row.get::<_, i64>(0).unwrap_or(0), row.get::<_, i64>(1).unwrap_or(0))),
-            ).unwrap_or((0, 0));
-
-            let title = t("monthly_title", lang);
-            let peer_name = if !peer.name.is_empty() { &peer.name } else { &peer.interface };
-            let svg = generate_usage_chart_svg(&title, peer_name, monthly.0, monthly.1, &[(month_key.clone(), monthly.0, monthly.1)]);
-
+        let title = t("monthly_title", lang);
+        for (peer_name, totals, points) in items {
+            let svg = generate_usage_chart_svg(&title, &peer_name, totals.0, totals.1, &points);
             if let Ok(png) = render_svg_to_png(&svg, 2.0) {
                 let caption = format!("📅 <b>{}</b> - {}\n⬇️ {}\n⬆️ {}\n📈 Total: {}",
-                    title, peer_name, fmt_bytes(monthly.0), fmt_bytes(monthly.1), fmt_bytes(monthly.0 + monthly.1));
+                    title, peer_name, fmt_bytes(totals.0), fmt_bytes(totals.1), fmt_bytes(totals.0 + totals.1));
                 let _ = self.send_photo(chat_id, png, &caption, None).await;
             }
         }
     }
 
     async fn send_alltime_usage(&self, chat_id: i64, tg_user_id: i64, lang: &str) {
-        let conn = self.pool.get().unwrap();
-        let peers = self.get_user_peers(&conn, tg_user_id);
-        if peers.is_empty() {
+        let items: Vec<(String, (i64, i64))> = {
+            let conn = match self.pool.get() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let peers = self.get_user_peers(&conn, tg_user_id);
+            if peers.is_empty() {
+                Vec::new()
+            } else {
+                peers.into_iter().map(|peer| {
+                    let totals: (i64, i64) = conn.query_row(
+                        "SELECT COALESCE(SUM(rx_bytes), 0), COALESCE(SUM(tx_bytes), 0) FROM peer_usage_daily WHERE peer_id = ?1",
+                        params![peer.id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).unwrap_or((0, 0));
+                    let peer_name = if !peer.name.is_empty() { peer.name } else { peer.interface };
+                    (peer_name, totals)
+                }).collect()
+            }
+        };
+
+        if items.is_empty() {
             let _ = self.send_message(chat_id, &t("no_peers", lang), None).await;
             return;
         }
 
-        for peer in peers {
-            let totals = conn.query_row(
-                "SELECT COALESCE(SUM(rx), 0), COALESCE(SUM(tx), 0) FROM usage_monthly WHERE peer_id = ?1",
-                params![peer.id],
-                |row| Ok((row.get::<_, i64>(0).unwrap_or(0), row.get::<_, i64>(1).unwrap_or(0))),
-            ).unwrap_or((0, 0));
-
-            let title = t("alltime_title", lang);
-            let peer_name = if !peer.name.is_empty() { &peer.name } else { &peer.interface };
-            let svg = generate_usage_chart_svg(&title, peer_name, totals.0, totals.1, &[("All Time".to_string(), totals.0, totals.1)]);
-
+        let title = t("alltime_title", lang);
+        for (peer_name, totals) in items {
+            let svg = generate_usage_chart_svg(&title, &peer_name, totals.0, totals.1, &[("All Time".to_string(), totals.0, totals.1)]);
             if let Ok(png) = render_svg_to_png(&svg, 2.0) {
                 let caption = format!("📈 <b>{}</b> - {}\n⬇️ {}\n⬆️ {}\n📈 Total: {}",
                     title, peer_name, fmt_bytes(totals.0), fmt_bytes(totals.1), fmt_bytes(totals.0 + totals.1));
@@ -459,54 +634,428 @@ impl TelegramBot {
     }
 
     async fn send_fair_usage(&self, chat_id: i64, tg_user_id: i64, lang: &str) {
-        let conn = self.pool.get().unwrap();
-        let peers = self.get_user_peers(&conn, tg_user_id);
-        if peers.is_empty() {
+        let items = {
+            let conn = match self.pool.get() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let peers = self.get_user_peers(&conn, tg_user_id);
+            if peers.is_empty() {
+                Vec::new()
+            } else {
+                let now_utc = Utc::now();
+                let tz = parse_timezone("UTC");
+                let calendar = "gregorian";
+
+                peers.into_iter().map(|peer| {
+                    let dto = build_fair_usage_peer_status_dto(&conn, &peer, now_utc, tz, calendar, 1);
+                    let peer_name = if !peer.name.is_empty() { peer.name } else { peer.interface };
+                    let svg = generate_fair_usage_card_svg(&dto, &peer_name);
+                    let status_icon = if dto.throttled { "🔴" } else { "🟢" };
+                    let caption = format!("{} <b>Fair Usage Policy</b> - {}\nState: {}\nDown/Up: {} / {} Kbps",
+                        status_icon, peer_name, if dto.throttled { "Throttled" } else { "Normal" },
+                        dto.throttle_download_kbps, dto.throttle_upload_kbps);
+                    (svg, caption)
+                }).collect::<Vec<_>>()
+            }
+        };
+
+        if items.is_empty() {
             let _ = self.send_message(chat_id, &t("no_peers", lang), None).await;
             return;
         }
 
-        let now_utc = Utc::now();
-        let tz = parse_timezone("UTC");
-        let calendar = "gregorian";
-
-        for peer in peers {
-            let dto = build_fair_usage_peer_status_dto(&conn, &peer, now_utc, tz, calendar, 1);
-            let peer_name = if !peer.name.is_empty() { &peer.name } else { &peer.interface };
-            let svg = generate_fair_usage_card_svg(&dto, peer_name);
-
+        for (svg, caption) in items {
             if let Ok(png) = render_svg_to_png(&svg, 2.0) {
-                let status_icon = if dto.throttled { "🔴" } else { "🟢" };
-                let caption = format!("{} <b>Fair Usage Policy</b> - {}\nState: {}\nDown/Up: {} / {} Kbps",
-                    status_icon, peer_name, if dto.throttled { "Throttled" } else { "Normal" },
-                    dto.throttle_download_kbps, dto.throttle_upload_kbps);
                 let _ = self.send_photo(chat_id, png, &caption, None).await;
             }
         }
     }
 
     async fn send_admin_menu(&self, chat_id: i64, tg_user_id: i64, lang: &str) {
-        let conn = self.pool.get().unwrap();
-        let admin_chat_id = conn.query_row(
-            "SELECT value FROM settings_kv WHERE key = 'tg_admin_chat_id'",
-            [],
-            |row| row.get::<_, String>(0),
-        ).unwrap_or_default();
-
-        if admin_chat_id.trim() != tg_user_id.to_string() && admin_chat_id.trim() != chat_id.to_string() {
+        if !self.is_admin(tg_user_id, None) {
             let _ = self.send_message(chat_id, &t("admin_unauthorized", lang), None).await;
             return;
         }
 
-        let routers_count: i64 = conn.query_row("SELECT COUNT(*) FROM routers", [], |r| r.get(0)).unwrap_or(0);
-        let peers_count: i64 = conn.query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0)).unwrap_or(0);
-        let users_count: i64 = conn.query_row("SELECT COUNT(*) FROM telegram_users", [], |r| r.get(0)).unwrap_or(0);
+        let (routers_count, peers_count, users_count, broadcasts_count) = {
+            let conn = match self.pool.get() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let rc: i64 = conn.query_row("SELECT COUNT(*) FROM routers", [], |r| r.get(0)).unwrap_or(0);
+            let pc: i64 = conn.query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0)).unwrap_or(0);
+            let uc: i64 = conn.query_row("SELECT COUNT(*) FROM telegram_users", [], |r| r.get(0)).unwrap_or(0);
+            let bc: i64 = conn.query_row("SELECT COUNT(*) FROM telegram_broadcasts", [], |r| r.get(0)).unwrap_or(0);
+            (rc, pc, uc, bc)
+        };
 
         let msg = format!(
-            "🛡️ <b>Admin Dashboard</b>\n\nRouters: {}\nTotal Peers: {}\nTelegram Users: {}",
-            routers_count, peers_count, users_count
+            "🛡️ <b>Admin Dashboard</b>\n\n📡 <b>Routers:</b> {}\n👥 <b>Total Peers:</b> {}\n📱 <b>Telegram Users:</b> {}\n📢 <b>Broadcasts:</b> {}",
+            routers_count, peers_count, users_count, broadcasts_count
         );
-        let _ = self.send_message(chat_id, &msg, None).await;
+
+        let keyboard = json!({
+            "inline_keyboard": [
+                [
+                    { "text": format!("👥 Users ({})", users_count), "callback_data": "adm:users:0" },
+                    { "text": format!("📢 Outbox ({})", broadcasts_count), "callback_data": "adm:outbox:0" }
+                ],
+                [
+                    { "text": "📊 All Peers: Today", "callback_data": "adm:peers:today" },
+                    { "text": "📅 All Peers: Month", "callback_data": "adm:peers:monthly" }
+                ],
+                [
+                    { "text": "📈 All Peers: All Time", "callback_data": "adm:peers:alltime" }
+                ],
+                [
+                    { "text": "🏠 Home", "callback_data": "menu:home" }
+                ]
+            ]
+        });
+
+        let _ = self.send_message(chat_id, &msg, Some(keyboard)).await;
+    }
+
+    async fn send_admin_users(&self, chat_id: i64, tg_user_id: i64, page: i64, lang: &str) {
+        if !self.is_admin(tg_user_id, None) {
+            let _ = self.send_message(chat_id, &t("admin_unauthorized", lang), None).await;
+            return;
+        }
+
+        let page_size = 6;
+        let offset = page * page_size;
+
+        let (total_users, user_items) = {
+            let conn = match self.pool.get() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let tu: i64 = conn.query_row("SELECT COUNT(*) FROM telegram_users", [], |r| r.get(0)).unwrap_or(0);
+            let items: Vec<(i64, String, String, bool, i64)> = match conn.prepare(
+                "SELECT u.id, u.telegram_username, u.first_name, u.is_blocked,
+                        (SELECT COUNT(*) FROM telegram_peer_bindings b WHERE b.telegram_user_id = u.id) as peer_count
+                 FROM telegram_users u ORDER BY u.id DESC LIMIT ?1 OFFSET ?2"
+            ) {
+                Ok(mut stmt) => {
+                    stmt.query_map(params![page_size, offset], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, bool>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    }).unwrap().flatten().collect()
+                }
+                Err(_) => Vec::new(),
+            };
+            (tu, items)
+        };
+
+        let total_pages = (total_users + page_size - 1) / page_size;
+        let mut user_buttons = Vec::new();
+        for (id, uname, fname, is_blocked, pcount) in user_items {
+            let label = if !uname.is_empty() {
+                format!("@{}", uname)
+            } else if !fname.is_empty() {
+                fname
+            } else {
+                format!("User #{}", id)
+            };
+            let status_icon = if is_blocked { "🔴" } else { "🟢" };
+            user_buttons.push(vec![
+                json!({
+                    "text": format!("{} {} ({} peers)", status_icon, label, pcount),
+                    "callback_data": format!("adm:user:{}", id)
+                })
+            ]);
+        }
+
+        let mut nav_row = Vec::new();
+        if page > 0 {
+            nav_row.push(json!({ "text": "⬅️ Prev", "callback_data": format!("adm:users:{}", page - 1) }));
+        }
+        if page + 1 < total_pages {
+            nav_row.push(json!({ "text": "Next ➡️", "callback_data": format!("adm:users:{}", page + 1) }));
+        }
+        if !nav_row.is_empty() {
+            user_buttons.push(nav_row);
+        }
+        user_buttons.push(vec![
+            json!({ "text": "« Back to Admin", "callback_data": "adm:menu" })
+        ]);
+
+        let text = format!("👥 <b>Telegram Users</b> (Page {} of {})\nTotal registered: {}", page + 1, std::cmp::max(1, total_pages), total_users);
+        let keyboard = json!({ "inline_keyboard": user_buttons });
+        let _ = self.send_message(chat_id, &text, Some(keyboard)).await;
+    }
+
+    async fn send_admin_user_detail(&self, chat_id: i64, tg_user_id: i64, user_db_id: i64, lang: &str) {
+        if !self.is_admin(tg_user_id, None) {
+            let _ = self.send_message(chat_id, &t("admin_unauthorized", lang), None).await;
+            return;
+        }
+
+        let user_data = {
+            let conn = match self.pool.get() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+
+            let user_info = conn.query_row(
+                "SELECT telegram_user_id, telegram_username, first_name, last_name, language, is_blocked, created_at FROM telegram_users WHERE id = ?1",
+                params![user_db_id],
+                |r| Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, bool>(5)?,
+                    r.get::<_, String>(6)?,
+                )),
+            );
+
+            match user_info {
+                Ok((target_tg_id, uname, fname, lname, user_lang, is_blocked, created_at)) => {
+                    let peers: Vec<String> = match conn.prepare(
+                        "SELECT p.id, p.name, p.public_key, p.interface FROM telegram_peer_bindings b
+                         JOIN peers p ON b.peer_id = p.id WHERE b.telegram_user_id = ?1"
+                    ) {
+                        Ok(mut stmt) => {
+                            stmt.query_map(params![user_db_id], |r| {
+                                let name: String = r.get(1)?;
+                                let pub_key: String = r.get(2)?;
+                                let iface: String = r.get(3)?;
+                                let display = if !name.is_empty() { name } else { pub_key.chars().take(8).collect::<String>() };
+                                Ok(format!("• {} ({})", display, iface))
+                            }).unwrap().flatten().collect()
+                        }
+                        Err(_) => Vec::new(),
+                    };
+                    Some((target_tg_id, uname, fname, lname, user_lang, is_blocked, created_at, peers))
+                }
+                Err(_) => None,
+            }
+        };
+
+        let (target_tg_id, uname, fname, lname, user_lang, is_blocked, created_at, peers) = match user_data {
+            Some(d) => d,
+            None => {
+                let _ = self.send_message(chat_id, "User not found", None).await;
+                return;
+            }
+        };
+
+        let peers_list = if peers.is_empty() { "No peers linked".to_string() } else { peers.join("\n") };
+        let block_label = if is_blocked { "🟢 Unblock User" } else { "🚫 Block User" };
+
+        let text = format!(
+            "👤 <b>User Details</b>\n\n<b>ID:</b> <code>{}</code>\n<b>Username:</b> @{}\n<b>Name:</b> {} {}\n<b>Language:</b> {}\n<b>Status:</b> {}\n<b>Created:</b> {}\n\n<b>Linked Peers:</b>\n{}",
+            target_tg_id, uname, fname, lname, user_lang, if is_blocked { "🔴 Blocked" } else { "🟢 Active" }, created_at, peers_list
+        );
+
+        let keyboard = json!({
+            "inline_keyboard": [
+                [
+                    { "text": block_label, "callback_data": format!("adm:toggle_block:{}", user_db_id) }
+                ],
+                [
+                    { "text": "« Back to Users", "callback_data": "adm:users:0" },
+                    { "text": "🛡️ Admin Menu", "callback_data": "adm:menu" }
+                ]
+            ]
+        });
+
+        let _ = self.send_message(chat_id, &text, Some(keyboard)).await;
+    }
+
+    async fn toggle_user_block(&self, chat_id: i64, tg_user_id: i64, user_db_id: i64, lang: &str) {
+        if !self.is_admin(tg_user_id, None) {
+            return;
+        }
+
+        {
+            let conn = match self.pool.get() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let _ = conn.execute("UPDATE telegram_users SET is_blocked = NOT is_blocked WHERE id = ?1", params![user_db_id]);
+        }
+
+        self.send_admin_user_detail(chat_id, tg_user_id, user_db_id, lang).await;
+    }
+
+    async fn send_admin_peers_usage(&self, chat_id: i64, tg_user_id: i64, scope: &str, lang: &str) {
+        if !self.is_admin(tg_user_id, None) {
+            let _ = self.send_message(chat_id, &t("admin_unauthorized", lang), None).await;
+            return;
+        }
+
+        let (total_rx, total_tx, lines) = {
+            let conn = match self.pool.get() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+
+            let peer_rows: Vec<(i64, String, String, String)> = match conn.prepare(
+                "SELECT p.id, p.name, p.public_key, p.interface FROM peers p ORDER BY p.name ASC"
+            ) {
+                Ok(mut stmt) => {
+                    stmt.query_map([], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    }).unwrap().flatten().collect()
+                }
+                Err(_) => Vec::new(),
+            };
+
+            let mut trx: i64 = 0;
+            let mut ttx: i64 = 0;
+            let mut lns = Vec::new();
+
+            let today_utc = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+            let month_prefix = Utc::now().date_naive().format("%Y-%m").to_string();
+
+            for (pid, name, pubkey, iface) in peer_rows {
+                let display = if !name.is_empty() { name } else { pubkey.chars().take(8).collect::<String>() };
+                let (rx, tx) = match scope {
+                    "today" => {
+                        conn.query_row(
+                            "SELECT rx_bytes, tx_bytes FROM peer_usage_daily WHERE peer_id = ?1 AND date = ?2",
+                            params![pid, today_utc],
+                            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                        ).unwrap_or((0, 0))
+                    },
+                    "monthly" => {
+                        conn.query_row(
+                            "SELECT COALESCE(SUM(rx_bytes), 0), COALESCE(SUM(tx_bytes), 0) FROM peer_usage_daily WHERE peer_id = ?1 AND date LIKE ?2",
+                            params![pid, format!("{}%", month_prefix)],
+                            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                        ).unwrap_or((0, 0))
+                    },
+                    _ => {
+                        conn.query_row(
+                            "SELECT COALESCE(SUM(rx_bytes), 0), COALESCE(SUM(tx_bytes), 0) FROM peer_usage_daily WHERE peer_id = ?1",
+                            params![pid],
+                            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                        ).unwrap_or((0, 0))
+                    }
+                };
+
+                trx += rx;
+                ttx += tx;
+                if rx > 0 || tx > 0 {
+                    lns.push(format!("• <b>{}</b> ({})\n  ⬇️ {} | ⬆️ {} | Total: {}",
+                        display, iface, fmt_bytes(rx), fmt_bytes(tx), fmt_bytes(rx + tx)));
+                }
+            }
+
+            (trx, ttx, lns)
+        };
+
+        let scope_title = match scope {
+            "today" => "Today's Bandwidth",
+            "monthly" => "This Month's Bandwidth",
+            _ => "All-time Bandwidth",
+        };
+
+        let summary_header = format!(
+            "📊 <b>All Peers Summary ({})</b>\n⬇️ {}\n⬆️ {}\n📈 <b>Total: {}</b>\n\n",
+            scope_title, fmt_bytes(total_rx), fmt_bytes(total_tx), fmt_bytes(total_rx + total_tx)
+        );
+
+        let body = if lines.is_empty() {
+            format!("{}<i>No bandwidth recorded for this period.</i>", summary_header)
+        } else {
+            let combined = lines.join("\n\n");
+            if combined.chars().count() > 3000 {
+                format!("{}{}\n<i>...and more</i>", summary_header, lines.iter().take(15).cloned().collect::<Vec<_>>().join("\n\n"))
+            } else {
+                format!("{}{}", summary_header, combined)
+            }
+        };
+
+        let keyboard = json!({
+            "inline_keyboard": [
+                [
+                    { "text": "📊 Today", "callback_data": "adm:peers:today" },
+                    { "text": "📅 Monthly", "callback_data": "adm:peers:monthly" },
+                    { "text": "📈 All Time", "callback_data": "adm:peers:alltime" }
+                ],
+                [
+                    { "text": "« Back to Admin", "callback_data": "adm:menu" }
+                ]
+            ]
+        });
+
+        let _ = self.send_message(chat_id, &body, Some(keyboard)).await;
+    }
+
+    async fn send_admin_outbox(&self, chat_id: i64, tg_user_id: i64, page: i64, lang: &str) {
+        if !self.is_admin(tg_user_id, None) {
+            let _ = self.send_message(chat_id, &t("admin_unauthorized", lang), None).await;
+            return;
+        }
+
+        let page_size = 5;
+        let offset = page * page_size;
+
+        let (total, items) = {
+            let conn = match self.pool.get() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let tot: i64 = conn.query_row("SELECT COUNT(*) FROM telegram_broadcasts", [], |r| r.get(0)).unwrap_or(0);
+            let b_items: Vec<String> = match conn.prepare(
+                "SELECT id, body, recipient_mode, status, total_count, sent_count, failed_count, created_at
+                 FROM telegram_broadcasts ORDER BY id DESC LIMIT ?1 OFFSET ?2"
+            ) {
+                Ok(mut stmt) => {
+                    stmt.query_map(params![page_size, offset], |row| {
+                        let id: i64 = row.get(0)?;
+                        let body: String = row.get(1)?;
+                        let mode: String = row.get(2)?;
+                        let status: String = row.get(3)?;
+                        let total_c: i64 = row.get(4)?;
+                        let sent_c: i64 = row.get(5)?;
+                        let failed_c: i64 = row.get(6)?;
+                        let created_at: String = row.get(7)?;
+                        let preview: String = body.chars().take(40).collect();
+                        Ok(format!(
+                            "📢 <b>Broadcast #{}</b> ({})\nStatus: <b>{}</b> (sent: {}, failed: {}, total: {})\nCreated: {}\nPreview: <i>{}</i>",
+                            id, mode, status, sent_c, failed_c, total_c, created_at, preview
+                        ))
+                    }).unwrap().flatten().collect()
+                }
+                Err(_) => Vec::new(),
+            };
+            (tot, b_items)
+        };
+
+        let total_pages = (total + page_size - 1) / page_size;
+        let text = if items.is_empty() {
+            "📢 <b>Outbox Broadcasts</b>\nNo broadcasts created yet.".to_string()
+        } else {
+            format!("📢 <b>Outbox Broadcasts</b> (Page {} of {})\n\n{}", page + 1, std::cmp::max(1, total_pages), items.join("\n\n"))
+        };
+
+        let mut nav_row = Vec::new();
+        if page > 0 {
+            nav_row.push(json!({ "text": "⬅️ Prev", "callback_data": format!("adm:outbox:{}", page - 1) }));
+        }
+        if page + 1 < total_pages {
+            nav_row.push(json!({ "text": "Next ➡️", "callback_data": format!("adm:outbox:{}", page + 1) }));
+        }
+
+        let mut buttons = Vec::new();
+        if !nav_row.is_empty() {
+            buttons.push(nav_row);
+        }
+        buttons.push(vec![json!({ "text": "« Back to Admin", "callback_data": "adm:menu" })]);
+
+        let keyboard = json!({ "inline_keyboard": buttons });
+        let _ = self.send_message(chat_id, &text, Some(keyboard)).await;
     }
 
     fn get_user_peers(&self, conn: &rusqlite::Connection, tg_user_id: i64) -> Vec<Peer> {

@@ -887,5 +887,18 @@ mod tests {
         assert!(notif_row.1);
         assert!(notif_row.2);
         assert!(notif_row.3);
+
+        // Test admin chat ID retrieval with formatting
+        conn.execute(
+            "INSERT INTO settings_kv (key, value) VALUES ('tg_admin_chat_id', '  123456789  ')",
+            [],
+        ).unwrap();
+
+        let admin_raw: String = conn.query_row(
+            "SELECT value FROM settings_kv WHERE key = 'tg_admin_chat_id'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(admin_raw.trim().parse::<i64>().unwrap(), 123456789i64);
     }
 }
