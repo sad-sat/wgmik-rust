@@ -3,56 +3,54 @@ pub mod schema;
 
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::Connection;
+use schema::run_migrations;
+use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 
-#[derive(Debug)]
-pub struct CustomCustomizer;
-
-impl r2d2::CustomizeConnection<Connection, rusqlite::Error> for CustomCustomizer {
-    fn on_acquire(&self, conn: &mut Connection) -> Result<(), rusqlite::Error> {
-        conn.execute_batch(r#"
-            PRAGMA foreign_keys = ON;
-            PRAGMA busy_timeout = 30000;
-            PRAGMA synchronous = NORMAL;
-        "#)?;
-        Ok(())
-    }
-}
-
-pub fn get_sqlite_path(database_url: &str) -> PathBuf {
-    if let Some(path_str) = database_url.strip_prefix("sqlite:////") {
-        PathBuf::from(format!("/{}", path_str))
-    } else if let Some(path_str) = database_url.strip_prefix("sqlite:///") {
-        PathBuf::from(path_str)
-    } else if let Some(path_str) = database_url.strip_prefix("sqlite:") {
-        PathBuf::from(path_str)
-    } else {
-        PathBuf::from("./wgmik.db")
-    }
-}
-
 pub fn create_pool(database_url: &str) -> DbPool {
-    let db_path = get_sqlite_path(database_url);
-    if let Some(parent) = db_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let path = sqlite_path_from_url(database_url).unwrap_or_else(|| PathBuf::from("./wgmik.db"));
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
     }
 
-    let manager = SqliteConnectionManager::file(&db_path);
-    let pool = Pool::builder()
-        .max_size(16)
-        .min_idle(Some(2))
-        .connection_timeout(Duration::from_secs(30))
-        .connection_customizer(Box::new(CustomCustomizer))
-        .build(manager)
-        .expect("Failed to initialize SQLite connection pool");
+    let manager = SqliteConnectionManager::file(&path)
+        .with_init(|c| {
+            c.execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+                PRAGMA busy_timeout = 30000;
+                PRAGMA cache_size = -2000;
+                PRAGMA temp_store = MEMORY;
+                "#,
+            )?;
+            Ok(())
+        });
 
-    // Initialize schema and migrations on startup
-    let conn = pool.get().expect("Failed to acquire connection for schema init");
-    schema::initialize_database(&conn).expect("Failed to initialize database schema");
+    let pool = Pool::builder()
+        .max_size(4)
+        .min_idle(Some(1))
+        .idle_timeout(Some(std::time::Duration::from_secs(60)))
+        .build(manager)
+        .expect("Failed to create SQLite connection pool");
+
+    {
+        let conn = pool.get().expect("Failed to obtain DB connection for migration");
+        run_migrations(&conn).expect("Database migration failed");
+    }
 
     pool
+}
+
+fn sqlite_path_from_url(database_url: &str) -> Option<PathBuf> {
+    if let Some(path_str) = database_url.strip_prefix("sqlite:////") {
+        Some(PathBuf::from(format!("/{}", path_str)))
+    } else if let Some(path_str) = database_url.strip_prefix("sqlite:///") {
+        Some(PathBuf::from(path_str))
+    } else {
+        None
+    }
 }

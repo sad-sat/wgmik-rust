@@ -335,7 +335,7 @@ fn table_columns(conn: &Connection, table: &str) -> Result<std::collections::Has
     Ok(cols)
 }
 
-fn run_migrations(conn: &Connection) -> Result<()> {
+pub fn run_migrations(conn: &Connection) -> Result<()> {
     // 1. fair_usage_rules
     if let Ok(cols) = table_columns(conn, "fair_usage_rules") {
         if !cols.contains("scope_period_count") {

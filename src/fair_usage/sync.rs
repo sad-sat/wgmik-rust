@@ -3,14 +3,13 @@ use super::usage::peer_scope_usage_for_rule;
 use crate::calendar::Tz;
 use crate::db::models::{FairUsageRule, FairUsageState, FairUsageTier, Peer};
 use crate::db::DbPool;
-use crate::routeros::RouterOSClient;
+use crate::routeros::AnyRouterOSClient;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Result};
 
 pub const FU_QUEUE_PREFIX: &str = "wgmik-fu-";
 
 pub fn get_applicable_fair_usage_rules(conn: &Connection, peer: &Peer) -> Result<Vec<FairUsageRule>> {
-    // 1. Peer-specific assignments
     let mut stmt = conn.prepare(
         "SELECT r.id, r.name, r.description, r.quota_mode, r.download_quota_bytes, r.upload_quota_bytes,
                 r.throttle_download_kbps, r.throttle_upload_kbps, r.time_scope, r.scope_period_count,
@@ -30,7 +29,6 @@ pub fn get_applicable_fair_usage_rules(conn: &Connection, peer: &Peer) -> Result
         return Ok(assigned);
     }
 
-    // 2. Router-scoped & global rules
     let mut stmt2 = conn.prepare(
         "SELECT id, name, description, quota_mode, download_quota_bytes, upload_quota_bytes,
                 throttle_download_kbps, throttle_upload_kbps, time_scope, scope_period_count,
@@ -141,7 +139,7 @@ pub fn evaluate_fair_usage_chain(
 pub async fn apply_fair_usage_policy(
     pool: &DbPool,
     peer: &Peer,
-    client: Option<&Box<dyn RouterOSClient>>,
+    client: Option<&AnyRouterOSClient>,
     now_utc: DateTime<Utc>,
     tz: Tz,
     calendar: &str,
