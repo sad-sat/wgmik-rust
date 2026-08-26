@@ -522,8 +522,24 @@ pub async fn get_telegram_notifications(headers: HeaderMap, State(state): State<
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
     };
 
+    // Ensure default notification events exist
+    let default_events = [
+        "quota_warning_80",
+        "quota_warning_90",
+        "quota_hit",
+        "quota_lifted",
+        "daily_summary",
+        "weekly_summary",
+    ];
+    for evt in default_events {
+        let _ = conn.execute(
+            "INSERT INTO telegram_notification_config (event_type, notify_clients, notify_admin, enabled) VALUES (?1, 1, 1, 1) ON CONFLICT(event_type) DO NOTHING",
+            params![evt],
+        );
+    }
+
     let mut stmt = match conn.prepare(
-        "SELECT id, event_type, notify_clients, notify_admin, enabled FROM telegram_notification_configs ORDER BY id ASC"
+        "SELECT id, event_type, notify_clients, notify_admin, enabled FROM telegram_notification_config ORDER BY id ASC"
     ) {
         Ok(s) => s,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
@@ -556,24 +572,24 @@ pub async fn update_telegram_notifications(headers: HeaderMap, State(state): Sta
     if let Some(configs) = payload.configs {
         for c in configs {
             let existing: Option<i64> = conn.query_row(
-                "SELECT id FROM telegram_notification_configs WHERE event_type = ?1",
+                "SELECT id FROM telegram_notification_config WHERE event_type = ?1",
                 params![c.event_type],
                 |r| r.get(0),
             ).ok();
 
             if let Some(id) = existing {
                 if let Some(nc) = c.notify_clients {
-                    let _ = conn.execute("UPDATE telegram_notification_configs SET notify_clients = ?1 WHERE id = ?2", params![nc, id]);
+                    let _ = conn.execute("UPDATE telegram_notification_config SET notify_clients = ?1 WHERE id = ?2", params![nc, id]);
                 }
                 if let Some(na) = c.notify_admin {
-                    let _ = conn.execute("UPDATE telegram_notification_configs SET notify_admin = ?1 WHERE id = ?2", params![na, id]);
+                    let _ = conn.execute("UPDATE telegram_notification_config SET notify_admin = ?1 WHERE id = ?2", params![na, id]);
                 }
                 if let Some(en) = c.enabled {
-                    let _ = conn.execute("UPDATE telegram_notification_configs SET enabled = ?1 WHERE id = ?2", params![en, id]);
+                    let _ = conn.execute("UPDATE telegram_notification_config SET enabled = ?1 WHERE id = ?2", params![en, id]);
                 }
             } else {
                 let _ = conn.execute(
-                    "INSERT INTO telegram_notification_configs (event_type, notify_clients, notify_admin, enabled) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO telegram_notification_config (event_type, notify_clients, notify_admin, enabled) VALUES (?1, ?2, ?3, ?4)",
                     params![c.event_type, c.notify_clients.unwrap_or(true), c.notify_admin.unwrap_or(true), c.enabled.unwrap_or(true)],
                 );
             }
@@ -855,5 +871,21 @@ mod tests {
         assert_eq!(tok_row.0, "tok_12345");
         assert_eq!(tok_row.1, "[1, 2]");
         assert!(tok_row.2);
+
+        // Test telegram_notification_config
+        conn.execute(
+            "INSERT INTO telegram_notification_config (event_type, notify_clients, notify_admin, enabled) VALUES ('quota_hit', 1, 1, 1)",
+            [],
+        ).unwrap();
+
+        let notif_row: (String, bool, bool, bool) = conn.query_row(
+            "SELECT event_type, notify_clients, notify_admin, enabled FROM telegram_notification_config WHERE event_type = 'quota_hit'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        assert_eq!(notif_row.0, "quota_hit");
+        assert!(notif_row.1);
+        assert!(notif_row.2);
+        assert!(notif_row.3);
     }
 }
