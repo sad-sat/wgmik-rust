@@ -21,10 +21,11 @@ use tracing::{info, warn};
 #[derive(Clone)]
 pub struct TelegramBot {
     client: Client,
-    token: String,
+    pub token: String,
     pool: DbPool,
     secret_key: String,
     running: Arc<AtomicBool>,
+    started_at: chrono::DateTime<Utc>,
 }
 
 impl TelegramBot {
@@ -35,6 +36,34 @@ impl TelegramBot {
             pool,
             secret_key,
             running: Arc::new(AtomicBool::new(false)),
+            started_at: Utc::now(),
+        }
+    }
+
+    pub fn uptime_seconds(&self) -> i64 {
+        (Utc::now() - self.started_at).num_seconds().max(0)
+    }
+
+    pub fn started_at_str(&self) -> String {
+        self.started_at.to_rfc3339()
+    }
+
+    pub async fn get_me(&self) -> Result<String, String> {
+        let resp = self.client.get(&self.api_url("getMe"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let val = resp.json::<Value>().await.map_err(|e| e.to_string())?;
+        if val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let username = val.get("result")
+                .and_then(|r| r.get("username"))
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(username)
+        } else {
+            let desc = val.get("description").and_then(|d| d.as_str()).unwrap_or("Telegram API error");
+            Err(desc.to_string())
         }
     }
 

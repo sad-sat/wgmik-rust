@@ -10,7 +10,7 @@ pub mod telegram;
 pub mod users;
 
 pub use auth::AppState;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 
 pub fn build_api_router(state: AppState) -> Router {
@@ -76,8 +76,14 @@ pub fn build_api_router(state: AppState) -> Router {
         .route("/api/telegram/tokens", get(telegram::list_telegram_tokens).post(telegram::create_telegram_token))
         .route("/api/telegram/tokens/:id", delete(telegram::delete_telegram_token))
         .route("/api/telegram/users", get(telegram::list_telegram_users))
+        .route("/api/telegram/users/:id", delete(telegram::delete_telegram_user).patch(telegram::patch_telegram_user))
+        .route("/api/telegram/users/:id/peers", put(telegram::set_telegram_user_peers))
+        .route("/api/telegram/notifications", get(telegram::get_telegram_notifications).put(telegram::update_telegram_notifications))
         .route("/api/telegram/broadcasts", get(telegram::list_telegram_broadcasts).post(telegram::create_telegram_broadcast))
+        .route("/api/telegram/broadcasts/:id", get(telegram::get_telegram_broadcast))
+        .route("/api/telegram/broadcasts/:id/retry-failed", post(telegram::retry_failed_telegram_broadcast))
         .route("/api/telegram/test-notify", post(telegram::test_telegram_notify))
+        .route("/api/telegram/test-notify/:event", post(telegram::test_telegram_notify_event))
         // Admin
         .route("/api/admin/usage_maintenance", get(admin::get_usage_maintenance))
         .route("/api/admin/usage_maintenance/run", post(admin::run_usage_maintenance))
