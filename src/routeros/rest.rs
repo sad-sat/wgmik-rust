@@ -111,8 +111,16 @@ impl RouterOSRestClient {
         if let Some(arr) = res.as_array() {
             for item in arr {
                 if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
-                    ifaces.push(name.to_string());
+                    let trimmed = name.trim();
+                    if !trimmed.is_empty() {
+                        ifaces.push(trimmed.to_string());
+                    }
                 }
+            }
+        } else if let Some(name) = res.get("name").and_then(|v| v.as_str()) {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                ifaces.push(trimmed.to_string());
             }
         }
         Ok(ifaces)
@@ -308,19 +316,60 @@ impl RouterOSRestClient {
     }
 
     pub async fn get_wireguard_interface(&self, interface: &str) -> Result<WGInterfaceConfig, String> {
-        let path = format!("interface/wireguard/{}", interface);
-        let res = self.request_json(Method::GET, &path, None).await?;
+        let res = self.request_json(Method::GET, "interface/wireguard", None).await?;
+        let mut target_row = None;
 
-        let name = res.get("name").and_then(|v| v.as_str()).unwrap_or(interface).to_string();
-        let public_key = res.get("public-key").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let listen_port = res.get("listen-port").and_then(|v| v.as_u64()).unwrap_or(13231) as u16;
-        let private_key = res.get("private-key").and_then(|v| v.as_str()).map(|s| s.to_string());
+        if let Some(arr) = res.as_array() {
+            for item in arr {
+                if item.get("name").and_then(|v| v.as_str()) == Some(interface) {
+                    target_row = Some(item.clone());
+                    break;
+                }
+            }
+        } else if res.get("name").and_then(|v| v.as_str()) == Some(interface) {
+            target_row = Some(res.clone());
+        }
+
+        let row = match target_row {
+            Some(r) => r,
+            None => return Err(format!("WireGuard interface '{}' not found", interface)),
+        };
+
+        let name = row.get("name").and_then(|v| v.as_str()).unwrap_or(interface).to_string();
+        let public_key = row.get("public-key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let listen_port = row.get("listen-port").and_then(|v| {
+            if let Some(n) = v.as_u64() {
+                Some(n as u16)
+            } else if let Some(s) = v.as_str() {
+                s.trim().parse::<u16>().ok()
+            } else {
+                None
+            }
+        }).unwrap_or(13231);
+        let private_key = row.get("private-key").and_then(|v| v.as_str()).map(|s| s.to_string());
 
         let mut addresses = Vec::new();
         if let Ok(addr_res) = self.request_json(Method::GET, "ip/address", None).await {
-            if let Some(arr) = addr_res.as_array() {
-                for item in arr {
-                    if item.get("interface").and_then(|v| v.as_str()) == Some(interface) {
+            let addr_items = if let Some(arr) = addr_res.as_array() {
+                arr.clone()
+            } else if addr_res.is_object() {
+                vec![addr_res]
+            } else {
+                Vec::new()
+            };
+            for item in addr_items {
+                if item.get("interface").and_then(|v| v.as_str()) == Some(interface) {
+                    let dis = item.get("disabled").map(|v| {
+                        if let Some(b) = v.as_bool() {
+                            b
+                        } else if let Some(s) = v.as_str() {
+                            let s = s.trim().to_lowercase();
+                            s == "true" || s == "yes" || s == "1"
+                        } else {
+                            false
+                        }
+                    }).unwrap_or(false);
+                    if !dis {
                         if let Some(a) = item.get("address").and_then(|v| v.as_str()) {
                             addresses.push(a.to_string());
                         }

@@ -49,10 +49,19 @@ pub struct UpdateRouterReq {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RouterTestResp {
-    pub success: bool,
-    pub version: String,
-    pub supported: bool,
-    pub error: Option<String>,
+    pub ok: bool,
+    pub ros_version: String,
+    pub ros_version_checked_at: String,
+    pub ros_supported: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WGInterfaceDTO {
+    pub name: String,
+    pub public_key: String,
+    pub listen_port: u16,
+    pub public_host: String,
+    pub addresses: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -330,7 +339,10 @@ pub async fn test_router(headers: HeaderMap, State(state): State<AppState>, Path
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
-    let conn = state.pool.get().unwrap();
+    let conn = match state.pool.get() {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"detail": format!("Database error: {}", e)}))).into_response(),
+    };
     let router_res = conn.query_row(
         "SELECT id, name, host, proto, port, username, secret_enc, tls_verify, enabled, ros_version, ros_supported FROM routers WHERE id = ?1",
         params![router_id],
@@ -352,32 +364,48 @@ pub async fn test_router(headers: HeaderMap, State(state): State<AppState>, Path
 
     let router = match router_res {
         Ok(r) => r,
-        Err(_) => return (StatusCode::NOT_FOUND, "Router not found").into_response(),
+        Err(_) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"detail": "Router not found"}))).into_response(),
     };
 
-    let client = make_client(&router, &state.settings.secret_key, Some(6));
-    match client.get_system_version().await {
-        Ok(ver) => {
-            let supp = is_routeros_supported(Some(&ver));
-            let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            let _ = conn.execute(
-                "UPDATE routers SET ros_version = ?1, ros_version_checked_at = ?2, ros_supported = ?3 WHERE id = ?4",
-                params![ver, now_str, supp, router_id],
-            );
-            (StatusCode::OK, Json(RouterTestResp {
-                success: true,
-                version: ver,
-                supported: supp,
-                error: None,
-            })).into_response()
+    let client = make_client(&router, &state.settings.secret_key, Some(8));
+    let ver = match client.get_system_version().await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"detail": format!("Router connection failed: {}", e)})),
+            ).into_response();
         }
-        Err(e) => (StatusCode::OK, Json(RouterTestResp {
-            success: false,
-            version: String::new(),
-            supported: false,
-            error: Some(e),
-        })).into_response(),
+    };
+
+    let supp = is_routeros_supported(Some(&ver));
+    let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let _ = conn.execute(
+        "UPDATE routers SET ros_version = ?1, ros_version_checked_at = ?2, ros_supported = ?3 WHERE id = ?4",
+        params![ver, now_str, supp, router_id],
+    );
+
+    if !supp {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"detail": format!("RouterOS 7.15 or newer is required (detected: {})", ver)})),
+        ).into_response();
     }
+
+    // Verify WireGuard interface querying
+    if let Err(e) = client.list_wireguard_interfaces().await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"detail": format!("Connected to router, but WireGuard interfaces query failed: {}", e)})),
+        ).into_response();
+    }
+
+    (StatusCode::OK, Json(RouterTestResp {
+        ok: true,
+        ros_version: ver,
+        ros_version_checked_at: now_str,
+        ros_supported: true,
+    })).into_response()
 }
 
 pub async fn list_router_interfaces(headers: HeaderMap, State(state): State<AppState>, Path(router_id): Path<i64>) -> impl IntoResponse {
@@ -385,16 +413,19 @@ pub async fn list_router_interfaces(headers: HeaderMap, State(state): State<AppS
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
-    let conn = state.pool.get().unwrap();
+    let conn = match state.pool.get() {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"detail": format!("Database error: {}", e)}))).into_response(),
+    };
     let router = match get_router_by_id(&conn, router_id) {
         Some(r) => r,
-        None => return (StatusCode::NOT_FOUND, "Router not found").into_response(),
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"detail": "Router not found"}))).into_response(),
     };
 
     let client = make_client(&router, &state.settings.secret_key, Some(10));
     match client.list_wireguard_interfaces().await {
         Ok(ifaces) => (StatusCode::OK, Json(ifaces)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"detail": format!("Failed to list interfaces: {}", e)}))).into_response(),
     }
 }
 
@@ -403,16 +434,34 @@ pub async fn get_router_interface(headers: HeaderMap, State(state): State<AppSta
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
-    let conn = state.pool.get().unwrap();
+    let conn = match state.pool.get() {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"detail": format!("Database error: {}", e)}))).into_response(),
+    };
     let router = match get_router_by_id(&conn, router_id) {
         Some(r) => r,
-        None => return (StatusCode::NOT_FOUND, "Router not found").into_response(),
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"detail": "Router not found"}))).into_response(),
     };
 
     let client = make_client(&router, &state.settings.secret_key, Some(10));
     match client.get_wireguard_interface(&iface).await {
-        Ok(cfg) => (StatusCode::OK, Json(cfg)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Ok(cfg) => {
+            let primary_host = client.get_primary_ipv4().await.unwrap_or_default();
+            let host = if !primary_host.is_empty() {
+                primary_host
+            } else {
+                router.host.clone()
+            };
+            let dto = WGInterfaceDTO {
+                name: cfg.name,
+                public_key: cfg.public_key,
+                listen_port: cfg.listen_port,
+                public_host: host,
+                addresses: cfg.addresses,
+            };
+            (StatusCode::OK, Json(dto)).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"detail": format!("Failed to get interface details: {}", e)}))).into_response(),
     }
 }
 
