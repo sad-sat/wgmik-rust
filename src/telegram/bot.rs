@@ -6,7 +6,7 @@ use crate::calendar::parse_timezone;
 use crate::db::models::Peer;
 use crate::db::DbPool;
 use crate::fair_usage::build_fair_usage_peer_status_dto;
-use chrono::Utc;
+use chrono::{Datelike, Timelike, Utc};
 use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use rusqlite::params;
@@ -579,7 +579,7 @@ impl TelegramBot {
     }
 
     async fn send_today_usage(&self, chat_id: i64, tg_user_id: i64, lang: &str) {
-        let items: Vec<(String, i64, i64)> = {
+        let items: Vec<(String, i64, i64, Vec<(String, i64, i64)>)> = {
             let conn = match self.pool.get() {
                 Ok(c) => c,
                 Err(_) => return,
@@ -588,15 +588,60 @@ impl TelegramBot {
             if peers.is_empty() {
                 Vec::new()
             } else {
-                let today_utc = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+                let now = Utc::now();
+                let today_start = now.date_naive().format("%Y-%m-%d 00:00:00").to_string();
+                let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+                let current_hour = now.hour() as usize;
+
                 peers.into_iter().map(|peer| {
-                    let (rx, tx) = conn.query_row(
-                        "SELECT rx, tx FROM usage_daily WHERE peer_id = ?1 AND day = ?2",
-                        params![peer.id, today_utc],
-                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                    ).unwrap_or((0, 0));
+                    let mut hourly_rx = vec![0i64; current_hour + 1];
+                    let mut hourly_tx = vec![0i64; current_hour + 1];
+
+                    if let Ok(mut stmt) = conn.prepare(
+                        "SELECT minute_ts, rx, tx FROM usage_minute
+                         WHERE peer_id = ?1 AND minute_ts >= ?2 AND minute_ts <= ?3
+                         ORDER BY minute_ts ASC"
+                    ) {
+                        if let Ok(rows) = stmt.query_map(params![peer.id, today_start, now_str], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                        }) {
+                            for row in rows.flatten() {
+                                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&row.0, "%Y-%m-%d %H:%M:%S") {
+                                    let h = dt.hour() as usize;
+                                    if h <= current_hour {
+                                        hourly_rx[h] += row.1;
+                                        hourly_tx[h] += row.2;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let total_rx: i64 = hourly_rx.iter().sum();
+                    let total_tx: i64 = hourly_tx.iter().sum();
+
+                    let (final_rx, final_tx) = if total_rx == 0 && total_tx == 0 {
+                        let today_date = now.date_naive().format("%Y-%m-%d").to_string();
+                        let (drx, dtx) = conn.query_row(
+                            "SELECT rx, tx FROM usage_daily WHERE peer_id = ?1 AND day = ?2",
+                            params![peer.id, today_date],
+                            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                        ).unwrap_or((0, 0));
+                        if drx > 0 || dtx > 0 {
+                            hourly_rx[current_hour] = drx;
+                            hourly_tx[current_hour] = dtx;
+                        }
+                        (drx, dtx)
+                    } else {
+                        (total_rx, total_tx)
+                    };
+
+                    let points: Vec<(String, i64, i64)> = (0..=current_hour)
+                        .map(|h| (format!("{:02}:00", h), hourly_rx[h], hourly_tx[h]))
+                        .collect();
+
                     let peer_name = if !peer.name.is_empty() { peer.name } else { peer.interface };
-                    (peer_name, rx, tx)
+                    (peer_name, final_rx, final_tx, points)
                 }).collect()
             }
         };
@@ -623,12 +668,12 @@ impl TelegramBot {
         }
 
         let title = t("today_title", lang);
-        for (peer_name, rx, tx) in items {
+        for (peer_name, rx, tx, points) in items {
             let escaped_name = escape_html(&peer_name);
             let caption = format!("📊 <b>{}</b> - {}\n⬇️ {}\n⬆️ {}\n📈 <b>Total:</b> {}",
                 title, escaped_name, fmt_bytes(rx), fmt_bytes(tx), fmt_bytes(rx + tx));
 
-            let svg = generate_usage_chart_svg(&title, &peer_name, rx, tx, &[("Today".to_string(), rx, tx)]);
+            let svg = generate_usage_chart_svg(&title, &peer_name, rx, tx, &points);
             if let Ok(png) = render_svg_to_png(&svg, 2.0) {
                 let _ = self.send_photo(chat_id, png, &caption, None).await;
             } else {
@@ -638,7 +683,7 @@ impl TelegramBot {
     }
 
     async fn send_monthly_usage(&self, chat_id: i64, tg_user_id: i64, lang: &str) {
-        let items: Vec<(String, (i64, i64), Vec<(String, i64, i64)>)> = {
+        let items: Vec<(String, i64, i64, Vec<(String, i64, i64)>)> = {
             let conn = match self.pool.get() {
                 Ok(c) => c,
                 Err(_) => return,
@@ -647,22 +692,41 @@ impl TelegramBot {
             if peers.is_empty() {
                 Vec::new()
             } else {
-                let month_prefix = Utc::now().date_naive().format("%Y-%m").to_string();
+                let now = Utc::now().date_naive();
+                let month_prefix = now.format("%Y-%m").to_string();
+                let current_day = now.day() as usize;
+
                 peers.into_iter().map(|peer| {
-                    let points: Vec<(String, i64, i64)> = match conn.prepare(
+                    let mut daily_map = std::collections::HashMap::new();
+                    if let Ok(mut stmt) = conn.prepare(
                         "SELECT day, rx, tx FROM usage_daily
-                         WHERE peer_id = ?1 AND day LIKE ?2 ORDER BY day ASC",
+                         WHERE peer_id = ?1 AND day LIKE ?2
+                         ORDER BY day ASC"
                     ) {
-                        Ok(mut stmt) => {
-                            stmt.query_map(params![peer.id, format!("{}%", month_prefix)], |row| {
-                                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
-                            }).unwrap().flatten().collect()
+                        if let Ok(rows) = stmt.query_map(params![peer.id, format!("{}%", month_prefix)], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+                        }) {
+                            for row in rows.flatten() {
+                                if let Ok(d) = chrono::NaiveDate::parse_from_str(&row.0, "%Y-%m-%d") {
+                                    daily_map.insert(d.day() as usize, (row.1, row.2));
+                                }
+                            }
                         }
-                        Err(_) => Vec::new(),
-                    };
-                    let totals = points.iter().fold((0i64, 0i64), |acc, p| (acc.0 + p.1, acc.1 + p.2));
+                    }
+
+                    let mut total_rx = 0i64;
+                    let mut total_tx = 0i64;
+                    let mut points = Vec::with_capacity(current_day);
+
+                    for d in 1..=current_day {
+                        let (rx, tx) = daily_map.get(&d).copied().unwrap_or((0, 0));
+                        total_rx += rx;
+                        total_tx += tx;
+                        points.push((format!("{}/{}", now.month(), d), rx, tx));
+                    }
+
                     let peer_name = if !peer.name.is_empty() { peer.name } else { peer.interface };
-                    (peer_name, totals, points)
+                    (peer_name, total_rx, total_tx, points)
                 }).collect()
             }
         };
@@ -689,12 +753,12 @@ impl TelegramBot {
         }
 
         let title = t("monthly_title", lang);
-        for (peer_name, totals, points) in items {
+        for (peer_name, totals_rx, totals_tx, points) in items {
             let escaped_name = escape_html(&peer_name);
             let caption = format!("📅 <b>{}</b> - {}\n⬇️ {}\n⬆️ {}\n📈 <b>Total:</b> {}",
-                title, escaped_name, fmt_bytes(totals.0), fmt_bytes(totals.1), fmt_bytes(totals.0 + totals.1));
+                title, escaped_name, fmt_bytes(totals_rx), fmt_bytes(totals_tx), fmt_bytes(totals_rx + totals_tx));
 
-            let svg = generate_usage_chart_svg(&title, &peer_name, totals.0, totals.1, &points);
+            let svg = generate_usage_chart_svg(&title, &peer_name, totals_rx, totals_tx, &points);
             if let Ok(png) = render_svg_to_png(&svg, 2.0) {
                 let _ = self.send_photo(chat_id, png, &caption, None).await;
             } else {
@@ -704,7 +768,7 @@ impl TelegramBot {
     }
 
     async fn send_alltime_usage(&self, chat_id: i64, tg_user_id: i64, lang: &str) {
-        let items: Vec<(String, (i64, i64))> = {
+        let items: Vec<(String, i64, i64, Vec<(String, i64, i64)>)> = {
             let conn = match self.pool.get() {
                 Ok(c) => c,
                 Err(_) => return,
@@ -714,13 +778,34 @@ impl TelegramBot {
                 Vec::new()
             } else {
                 peers.into_iter().map(|peer| {
-                    let totals: (i64, i64) = conn.query_row(
-                        "SELECT COALESCE(SUM(rx), 0), COALESCE(SUM(tx), 0) FROM usage_daily WHERE peer_id = ?1",
-                        params![peer.id],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    ).unwrap_or((0, 0));
+                    let mut points: Vec<(String, i64, i64)> = match conn.prepare(
+                        "SELECT day, rx, tx FROM usage_daily WHERE peer_id = ?1 ORDER BY day ASC"
+                    ) {
+                        Ok(mut stmt) => {
+                            stmt.query_map(params![peer.id], |r| {
+                                let day_str: String = r.get(0)?;
+                                let rx: i64 = r.get(1)?;
+                                let tx: i64 = r.get(2)?;
+                                let short_day = if let Ok(d) = chrono::NaiveDate::parse_from_str(&day_str, "%Y-%m-%d") {
+                                    format!("{}/{}", d.month(), d.day())
+                                } else {
+                                    day_str
+                                };
+                                Ok((short_day, rx, tx))
+                            }).unwrap().flatten().collect()
+                        }
+                        Err(_) => Vec::new(),
+                    };
+
+                    let total_rx: i64 = points.iter().map(|p| p.1).sum();
+                    let total_tx: i64 = points.iter().map(|p| p.2).sum();
+
+                    if points.len() == 1 {
+                        points.insert(0, ("Start".to_string(), 0, 0));
+                    }
+
                     let peer_name = if !peer.name.is_empty() { peer.name } else { peer.interface };
-                    (peer_name, totals)
+                    (peer_name, total_rx, total_tx, points)
                 }).collect()
             }
         };
@@ -747,12 +832,12 @@ impl TelegramBot {
         }
 
         let title = t("alltime_title", lang);
-        for (peer_name, totals) in items {
+        for (peer_name, total_rx, total_tx, points) in items {
             let escaped_name = escape_html(&peer_name);
             let caption = format!("📈 <b>{}</b> - {}\n⬇️ {}\n⬆️ {}\n📈 <b>Total:</b> {}",
-                title, escaped_name, fmt_bytes(totals.0), fmt_bytes(totals.1), fmt_bytes(totals.0 + totals.1));
+                title, escaped_name, fmt_bytes(total_rx), fmt_bytes(total_tx), fmt_bytes(total_rx + total_tx));
 
-            let svg = generate_usage_chart_svg(&title, &peer_name, totals.0, totals.1, &[("All Time".to_string(), totals.0, totals.1)]);
+            let svg = generate_usage_chart_svg(&title, &peer_name, total_rx, total_tx, &points);
             if let Ok(png) = render_svg_to_png(&svg, 2.0) {
                 let _ = self.send_photo(chat_id, png, &caption, None).await;
             } else {

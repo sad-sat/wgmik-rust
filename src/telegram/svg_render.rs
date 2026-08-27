@@ -8,6 +8,10 @@ static FONT_DB: OnceLock<Arc<fontdb::Database>> = OnceLock::new();
 fn get_font_db() -> Arc<fontdb::Database> {
     FONT_DB.get_or_init(|| {
         let mut db = fontdb::Database::new();
+        db.load_font_data(include_bytes!("../../assets/fonts/Vazirmatn-Regular.ttf").to_vec());
+        db.load_font_data(include_bytes!("../../assets/fonts/Vazirmatn-Medium.ttf").to_vec());
+        db.load_font_data(include_bytes!("../../assets/fonts/Vazirmatn-SemiBold.ttf").to_vec());
+        db.load_font_data(include_bytes!("../../assets/fonts/Vazirmatn-Bold.ttf").to_vec());
         let font_dir = std::path::Path::new("assets/fonts");
         if font_dir.exists() {
             db.load_fonts_dir(font_dir);
