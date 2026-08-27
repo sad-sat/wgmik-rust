@@ -4,3 +4,5 @@
 *.db-wal
 secret_key
 .env
+*.tar.gz
+wgmik-rust-*
