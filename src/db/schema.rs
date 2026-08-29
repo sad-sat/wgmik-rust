@@ -306,6 +306,9 @@ pub fn initialize_database(conn: &Connection) -> Result<()> {
     conn.execute_batch(r#"
         CREATE INDEX IF NOT EXISTS ix_usage_samples_peer_id_ts ON usage_samples (peer_id, ts);
         CREATE INDEX IF NOT EXISTS ix_usage_minute_peer_id_minute_ts ON usage_minute (peer_id, minute_ts);
+        CREATE INDEX IF NOT EXISTS ix_usage_minute_minute_ts ON usage_minute (minute_ts);
+        CREATE INDEX IF NOT EXISTS ix_usage_daily_day_peer_id ON usage_daily (day, peer_id);
+        CREATE INDEX IF NOT EXISTS ix_telegram_peer_bindings_user_visible ON telegram_peer_bindings (telegram_user_id, visible);
         CREATE INDEX IF NOT EXISTS ix_peers_selected_router_id_id ON peers (selected, router_id, id);
         CREATE INDEX IF NOT EXISTS ix_peers_router_id_interface ON peers (router_id, interface);
         CREATE INDEX IF NOT EXISTS ix_fair_usage_tiers_rule_id ON fair_usage_tiers (rule_id);

@@ -1,7 +1,7 @@
 pub mod models;
 pub mod schema;
 
-use r2d2::Pool;
+use r2d2::{ManageConnection, Pool};
 use r2d2_sqlite::SqliteConnectionManager;
 use schema::initialize_database;
 use std::fs;
@@ -23,24 +23,25 @@ pub fn create_pool(database_url: &str) -> DbPool {
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = NORMAL;
                 PRAGMA busy_timeout = 30000;
-                PRAGMA cache_size = -2000;
+                PRAGMA cache_size = -4000;
                 PRAGMA temp_store = MEMORY;
+                PRAGMA mmap_size = 134217728;
                 "#,
             )?;
             Ok(())
         });
 
+    // Initialize database schema first on a direct connection before pooling
+    if let Ok(init_conn) = manager.connect() {
+        let _ = initialize_database(&init_conn);
+    }
+
     let pool = Pool::builder()
-        .max_size(4)
+        .max_size(6)
         .min_idle(Some(1))
         .idle_timeout(Some(std::time::Duration::from_secs(60)))
         .build(manager)
         .expect("Failed to create SQLite connection pool");
-
-    {
-        let conn = pool.get().expect("Failed to obtain DB connection for migration");
-        initialize_database(&conn).expect("Database initialization failed");
-    }
 
     pool
 }

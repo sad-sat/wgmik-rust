@@ -31,9 +31,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
-    // Start runtime with 2 worker threads for low-memory environments
+    // Dynamically scale worker threads based on available CPU cores (min 2, max 4) for low RAM footprint
+    let threads = std::cmp::max(2, std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).min(4));
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(threads)
         .enable_all()
         .build()
         .expect("Failed to create Tokio runtime");

@@ -42,6 +42,8 @@ fn init_strings() -> HashMap<&'static str, (&'static str, &'static str)> {
     m.insert("notif_disabled", ("Notifications disabled.", "اعلان‌ها غیرفعال شدند."));
     m.insert("admin_panel", ("Admin Dashboard", "پنل مدیریت"));
     m.insert("admin_unauthorized", ("Unauthorized. You are not configured as admin.", "دسترسی غیرمجاز. شما به عنوان مدیر تنظیم نشده‌اید."));
+    m.insert("please_wait", ("⏳ Please wait, your previous request is still being processed...", "⏳ لطفاً کمی صبر کنید، درخواست قبلی شما هنوز در حال پردازش است..."));
+    m.insert("please_wait_short", ("⏳ Please wait...", "⏳ لطفاً کمی صبر کنید..."));
     m
 }
 

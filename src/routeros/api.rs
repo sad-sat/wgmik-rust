@@ -10,7 +10,9 @@ pub struct RouterOSApiClient {
     port: u16,
     username: String,
     password: String,
+    #[allow(dead_code)]
     use_tls: bool,
+    #[allow(dead_code)]
     ssl_verify: bool,
     timeout_duration: Duration,
 }

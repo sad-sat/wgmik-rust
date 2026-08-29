@@ -833,7 +833,6 @@ pub async fn test_telegram_notify_event(headers: HeaderMap, State(state): State<
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::db::schema::initialize_database;
 
     #[test]

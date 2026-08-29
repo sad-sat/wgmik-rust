@@ -6,4 +6,4 @@ pub mod svg_render;
 pub mod usage_chart;
 
 pub use bot::TelegramBot;
-pub use svg_render::{fmt_bytes, render_svg_to_png};
+pub use svg_render::{fmt_bytes, render_svg_to_png, render_svg_to_png_async};

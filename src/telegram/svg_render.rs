@@ -58,6 +58,23 @@ pub fn render_svg_to_png(svg: &str, scale: f32) -> Result<Vec<u8>, String> {
 
     let transform = tiny_skia::Transform::from_scale(scale, scale);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
-
     pixmap.encode_png().map_err(|e| format!("PNG encode error: {}", e))
 }
+
+static RENDER_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+fn get_render_semaphore() -> Arc<tokio::sync::Semaphore> {
+    RENDER_SEMAPHORE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2))).clone()
+}
+
+pub async fn render_svg_to_png_async(svg: String, scale: f32) -> Result<Vec<u8>, String> {
+    let sem = get_render_semaphore();
+    let permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        render_svg_to_png(&svg, scale)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
+}
+
